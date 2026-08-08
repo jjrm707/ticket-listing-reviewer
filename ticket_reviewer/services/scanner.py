@@ -161,11 +161,20 @@ class ScanCoordinator:
         repository_factory: RepositoryFactory,
         connectors: Iterable[MarketplaceConnector] = (),
         *,
+        connector_sources: Iterable[Source] | None = None,
         alert_service: AlertService | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         connector_tuple = tuple(connectors)
-        sources = [connector.source for connector in connector_tuple]
+        sources = list(
+            connector_sources
+            if connector_sources is not None
+            else (connector.source for connector in connector_tuple)
+        )
+        if len(sources) != len(connector_tuple):
+            raise ValueError("connector sources must match connectors")
+        if any(not isinstance(source, Source) for source in sources):
+            raise TypeError("connector source must be a Source")
         duplicate = next(
             (source for index, source in enumerate(sources) if source in sources[:index]),
             None,
@@ -176,6 +185,7 @@ class ScanCoordinator:
         self.session_factory = session_factory
         self.repository_factory = repository_factory
         self.connectors = connector_tuple
+        self._connector_sources = tuple(sources)
         self.alert_service = alert_service
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
@@ -189,22 +199,22 @@ class ScanCoordinator:
         opportunities_saved = 0
         actionable_opportunities = 0
 
-        for connector in self.connectors:
+        for connector, source in zip(self.connectors, self._connector_sources):
             try:
-                result = self._run_connector(connector, effective, started_at)
+                result = self._run_connector(connector, source, effective, started_at)
             except Exception as error:
                 safe_error = (
                     error.safe_message
                     if isinstance(error, ConnectorFailure)
                     else _UNEXPECTED_ERROR
                 )
-                failed.append(connector.source)
+                failed.append(source)
                 try:
-                    self._record_failed_run(connector.source, started_at, safe_error)
+                    self._record_failed_run(source, started_at, safe_error)
                 except Exception:
                     pass
                 continue
-            succeeded.append(connector.source)
+            succeeded.append(source)
             events_seen += result[0]
             observations_saved += result[1]
             opportunities_saved += result[2]
@@ -228,14 +238,15 @@ class ScanCoordinator:
     def _run_connector(
         self,
         connector: MarketplaceConnector,
+        source: Source,
         settings: RuntimeSettings,
         now: datetime,
     ) -> tuple[int, int, int, int]:
         session = self.session_factory()
         try:
             repositories = self.repository_factory(session)
-            run_id = repositories.runs.start(connector.source, now)
-            counts = self._collect(connector, repositories, settings, now)
+            run_id = repositories.runs.start(source, now)
+            counts = self._collect(connector, source, repositories, settings, now)
             repositories.runs.finish(
                 run_id,
                 success=True,
@@ -253,6 +264,7 @@ class ScanCoordinator:
     def _collect(
         self,
         connector: MarketplaceConnector,
+        source: Source,
         repositories: RepositoryBundle,
         settings: RuntimeSettings,
         now: datetime,
@@ -269,7 +281,7 @@ class ScanCoordinator:
             for event in events:
                 if not isinstance(event, ExternalEvent):
                     raise TypeError("connector returned an invalid event")
-                if event.source is not connector.source:
+                if event.source is not source:
                     raise ValueError("connector returned an event for another source")
                 event_key = (event.source, event.external_id)
                 if event_key in seen_events:
@@ -286,7 +298,7 @@ class ScanCoordinator:
                     if not isinstance(observation, SourceObservation):
                         raise TypeError("connector returned an invalid observation")
                     if (
-                        observation.source is not connector.source
+                        observation.source is not source
                         or observation.event_external_id != event.external_id
                     ):
                         raise ValueError("connector returned an observation for another event")

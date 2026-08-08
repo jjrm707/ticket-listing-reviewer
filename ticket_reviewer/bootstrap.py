@@ -46,6 +46,21 @@ def _cleanup_without_masking(
         original_error.add_note("additional owned resource cleanup failed")
 
 
+def _snapshot_connector_sources(
+    connectors: Iterable[MarketplaceConnector],
+) -> list[Source]:
+    """Read and validate each injected source once before acquiring clients."""
+    sources: list[Source] = []
+    for connector in connectors:
+        source = connector.source
+        if not isinstance(source, Source):
+            raise TypeError("connector source must be a Source")
+        if source in sources:
+            raise ValueError(f"duplicate connector source: {source.value}")
+        sources.append(source)
+    return sources
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationServices:
     base_settings: Settings
@@ -82,12 +97,11 @@ def build_services(
     if session_factory is None:
         _, session_factory = create_engine_and_session(settings.database_url)
     connector_list = list(connectors)
+    connector_sources = _snapshot_connector_sources(connector_list)
     owned_connectors: list[CloseableConnector] = []
     key = settings.ticketmaster_api_key
     configured_key = key.get_secret_value().strip() if key is not None else ""
-    if configured_key and all(
-        connector.source is not Source.TICKETMASTER for connector in connector_list
-    ):
+    if configured_key and Source.TICKETMASTER not in connector_sources:
         client = httpx.Client(timeout=settings.ticketmaster_http_timeout_seconds)
         try:
             connector = TicketmasterConnector(
@@ -99,14 +113,13 @@ def build_services(
             _cleanup_without_masking(error, (client,))
             raise
         connector_list.append(connector)
+        connector_sources.append(Source.TICKETMASTER)
         owned_connectors.append(connector)
     client_id = settings.seatgeek_client_id
     configured_client_id = (
         client_id.get_secret_value().strip() if client_id is not None else ""
     )
-    if configured_client_id and all(
-        connector.source is not Source.SEATGEEK for connector in connector_list
-    ):
+    if configured_client_id and Source.SEATGEEK not in connector_sources:
         try:
             client = httpx.Client(timeout=settings.seatgeek_http_timeout_seconds)
         except BaseException as error:
@@ -122,6 +135,7 @@ def build_services(
             _cleanup_without_masking(error, (client, *owned_connectors))
             raise
         connector_list.append(connector)
+        connector_sources.append(Source.SEATGEEK)
         owned_connectors.append(connector)
     connector_tuple = tuple(connector_list)
     try:
@@ -130,6 +144,7 @@ def build_services(
             session_factory,
             repository_factory,
             connector_tuple,
+            connector_sources=tuple(connector_sources),
             alert_service=alert_service,
             clock=clock,
         )

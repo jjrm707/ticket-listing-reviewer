@@ -674,7 +674,7 @@ def test_bootstrap_conditionally_registers_owned_seatgeek_and_preserves_injected
     services.close()
 
 
-def test_bootstrap_closes_all_created_clients_when_scanner_construction_fails(monkeypatch):
+def test_bootstrap_rejects_duplicate_injected_sources_before_creating_clients(monkeypatch):
     clients = []
 
     class ClientDouble:
@@ -712,8 +712,92 @@ def test_bootstrap_closes_all_created_clients_when_scanner_construction_fails(mo
             session_factory=lambda: None,
         )
 
-    assert len(clients) == 2
+    assert clients == []
+
+
+def test_bootstrap_snapshots_injected_source_once_before_client_acquisition(monkeypatch):
+    clients = []
+
+    class ClientDouble:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def client_factory(**_kwargs):
+        value = ClientDouble()
+        clients.append(value)
+        return value
+
+    class VolatileSourceConnector:
+        capabilities = frozenset({Capability.EVENT_SEARCH})
+
+        def __init__(self):
+            self.source_reads = 0
+
+        @property
+        def source(self):
+            self.source_reads += 1
+            if self.source_reads > 1:
+                raise RuntimeError("source was read more than once")
+            return Source.STUBHUB
+
+        def discover(self, *_args):
+            return []
+
+        def fetch_observations(self, _event):
+            return []
+
+    injected = VolatileSourceConnector()
+    monkeypatch.setattr("ticket_reviewer.bootstrap.httpx.Client", client_factory)
+
+    services = build_services(
+        Settings(
+            _env_file=None,
+            ticketmaster_api_key="ticketmaster-key",
+            seatgeek_client_id=CLIENT_ID,
+        ),
+        connectors=(injected,),
+        session_factory=lambda: None,
+    )
+
+    assert injected.source_reads == 1
+    assert services.connectors[0] is injected
+    services.close()
     assert [client.close_calls for client in clients] == [1, 1]
+
+
+def test_bootstrap_rejects_non_source_value_before_creating_clients(monkeypatch):
+    clients = []
+
+    class InvalidSourceConnector:
+        source = "stubhub"
+        capabilities = frozenset({Capability.EVENT_SEARCH})
+
+        def discover(self, *_args):
+            return []
+
+        def fetch_observations(self, _event):
+            return []
+
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.httpx.Client",
+        lambda **_kwargs: clients.append(object()),
+    )
+
+    with pytest.raises(TypeError, match="connector source must be a Source"):
+        build_services(
+            Settings(
+                _env_file=None,
+                ticketmaster_api_key="ticketmaster-key",
+                seatgeek_client_id=CLIENT_ID,
+            ),
+            connectors=(InvalidSourceConnector(),),
+            session_factory=lambda: None,
+        )
+
+    assert clients == []
 
 
 def test_bootstrap_closes_first_owned_client_when_second_client_construction_fails(
@@ -803,30 +887,25 @@ def test_scanner_failure_preserves_original_error_and_closes_seatgeek_when_ticke
         original_close(self)
         raise RuntimeError("sanitized ticketmaster cleanup failure")
 
-    class Injected:
-        source = Source.STUBHUB
-        capabilities = frozenset({Capability.EVENT_SEARCH})
-
-        def discover(self, *_args):
-            return []
-
-        def fetch_observations(self, _event):
-            return []
-
     monkeypatch.setattr("ticket_reviewer.bootstrap.httpx.Client", client_factory)
     monkeypatch.setattr(
         "ticket_reviewer.bootstrap.TicketmasterConnector.close",
         failing_ticketmaster_close,
     )
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.ScanCoordinator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("sanitized scanner construction failure")
+        ),
+    )
 
-    with pytest.raises(ValueError, match="duplicate connector source") as caught:
+    with pytest.raises(ValueError, match="scanner construction failure") as caught:
         build_services(
             Settings(
                 _env_file=None,
                 ticketmaster_api_key="ticketmaster-key",
                 seatgeek_client_id=CLIENT_ID,
             ),
-            connectors=(Injected(), Injected()),
             session_factory=lambda: None,
         )
 

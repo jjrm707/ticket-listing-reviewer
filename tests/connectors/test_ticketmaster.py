@@ -690,26 +690,21 @@ def test_bootstrap_closes_owned_client_when_service_composition_fails(monkeypatc
         def close(self):
             self.close_calls += 1
 
-    class InjectedConnector:
-        source = Source.STUBHUB
-        capabilities = frozenset({Capability.EVENT_SEARCH})
-
-        def discover(self, team, starts_after, starts_before):
-            return []
-
-        def fetch_observations(self, event):
-            return []
-
     client_double = ClientDouble()
     monkeypatch.setattr(
         "ticket_reviewer.bootstrap.httpx.Client",
         lambda **_kwargs: client_double,
     )
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.ScanCoordinator",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ValueError("sanitized scanner construction failure")
+        ),
+    )
 
-    with pytest.raises(ValueError, match="duplicate connector source: stubhub"):
+    with pytest.raises(ValueError, match="scanner construction failure"):
         build_services(
             Settings(_env_file=None, ticketmaster_api_key=API_KEY),
-            connectors=(InjectedConnector(), InjectedConnector()),
             session_factory=lambda: None,
         )
 
