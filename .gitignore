@@ -1,1 +1,10 @@
 .worktrees/
+.env
+.venv/
+.python313/
+data/*.db
+data/screenshots/
+logs/
+__pycache__/
+*.py[cod]
+*.egg-info/
