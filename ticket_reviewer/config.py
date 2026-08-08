@@ -1,10 +1,10 @@
 """Application configuration models."""
 
-from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Annotated, Literal
 
-from pydantic import SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,18 +40,25 @@ class Settings(BaseSettings):
     ntfy_access_token: SecretStr | None = None
 
 
-@dataclass(frozen=True, slots=True)
-class RuntimeSettings:
+class RuntimeSettings(BaseModel):
     """The non-secret settings available to runtime services."""
 
-    budget_cap: Decimal
-    alert_profit_threshold: Decimal
-    profit_improvement_threshold: Decimal
-    observation_freshness_minutes: int
-    scan_interval_minutes: int
-    ticketmaster_seller_fee_rate: Decimal
-    seatgeek_seller_fee_rate: Decimal
-    stubhub_seller_fee_rate: Decimal
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    budget_cap: Annotated[Decimal, Field(ge=Decimal("1"), le=Decimal("400"))]
+    alert_profit_threshold: Annotated[Decimal, Field(ge=Decimal("0"))]
+    profit_improvement_threshold: Annotated[Decimal, Field(ge=Decimal("0"))]
+    observation_freshness_minutes: Annotated[int, Field(ge=60, le=1440)]
+    scan_interval_minutes: Literal[60]
+    ticketmaster_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
+    seatgeek_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
+    stubhub_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "RuntimeSettings":
