@@ -423,13 +423,13 @@ _BEARER_SECRET = re.compile(r"(?i)\b(bearer\s+)([^\s,;]+)")
 _AUTHORIZATION_SECRET = re.compile(
     r'''(?ix)
     (?P<prefix>["']?authorization["']?\s*[:=]\s*)
-    (?:"[^"]*"|'[^']*'|[^\r\n]+)
+    (?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\r\n]+)
     '''
 )
 _COOKIE_SECRET = re.compile(
     r'''(?ix)
     (?P<prefix>["']?(?:set-)?cookie["']?\s*[:=]\s*)
-    (?:"[^"]*"|'[^']*'|[^\r\n]+)
+    (?:"(?:\\.|[^"])*"|'(?:\\.|[^'])*'|[^\r\n]+)
     '''
 )
 _URL_USERINFO_SECRET = re.compile(r"(://)[^/\s:@]+:[^/@\s]+@")

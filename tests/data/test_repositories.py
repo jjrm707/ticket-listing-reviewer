@@ -382,6 +382,11 @@ def test_connector_run_finish_records_result_and_redacts_error(session):
             "response=\"quoted-response\"'}",
             ("quoted-user", "quoted-response"),
         ),
+        (
+            '{"Authorization":"Digest username=\\"json-user-secret\\", '
+            'response=\\"json-response-secret\\""}',
+            ("json-user-secret", "json-response-secret"),
+        ),
         ("headers={'Authorization': 'Basic python-auth-secret'}", ("python-auth-secret",)),
         ('headers={"Authorization": "Basic json-auth-secret"}', ("json-auth-secret",)),
         ("url=https://user:url-secret@example.test/path", ("url-secret",)),
@@ -403,6 +408,16 @@ def test_connector_run_finish_records_result_and_redacts_error(session):
             'headers={"Set-Cookie": "session=json-cookie-secret; Path=/, '
             'csrf=json-csrf-secret"}',
             ("json-cookie-secret", "json-csrf-secret"),
+        ),
+        (
+            '{"Cookie":"session=\\"escaped-cookie-secret\\"; '
+            'csrf=\\"escaped-csrf-secret\\""}',
+            ("escaped-cookie-secret", "escaped-csrf-secret"),
+        ),
+        (
+            '{"Set-Cookie":"session=\\"escaped-set-cookie-secret\\"; Path=/, '
+            'csrf=\\"escaped-set-csrf-secret\\""}',
+            ("escaped-set-cookie-secret", "escaped-set-csrf-secret"),
         ),
     ],
 )
