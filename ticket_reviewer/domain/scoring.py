@@ -89,6 +89,13 @@ def _append_unique(reasons: list[str], reason: str) -> None:
         reasons.append(reason)
 
 
+def _known_label(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = normalize_label(value)
+    return normalized or None
+
+
 def _snapshot_trend(comparables: Sequence[Comparable]) -> tuple[bool, bool, bool]:
     by_time: dict[datetime, list[Decimal]] = defaultdict(list)
     for comparable in comparables:
@@ -199,15 +206,15 @@ def estimate_opportunity(
         confidence_drops += 1
         _append_unique(reasons, "fewer than 3 seat-level comparables")
 
+    candidate_section = _known_label(candidate.section)
     same_section = bool(
-        candidate.section
+        candidate_section
         and any(
-            comparable.section
-            and normalize_label(candidate.section) == normalize_label(comparable.section)
+            candidate_section == _known_label(comparable.section)
             for comparable in comparables
         )
     )
-    row_known = bool(candidate.row and normalize_label(candidate.row))
+    row_known = _known_label(candidate.row) is not None
     if not row_known or not same_section:
         confidence_drops += 1
         _append_unique(reasons, "seat quality unverified")

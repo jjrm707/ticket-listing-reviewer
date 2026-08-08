@@ -318,6 +318,26 @@ def test_sparse_comparables_receive_only_the_ten_percent_haircut(candidate):
     assert "sparse comparable haircut applied" in estimate.risk_reasons
 
 
+def test_blank_sections_keep_high_asks_conservative_and_lower_confidence(candidate):
+    changed = replace(candidate, section=" \t ", row="24")
+    observations = (
+        comp(changed, 1, "300", section="132", row="24"),
+        comp(changed, 2, "500", section="\n", row="24"),
+    )
+
+    scenarios = estimate_exit_scenarios(changed, observations, FEES, now=NOW)
+    estimate = estimate_opportunity(
+        changed, observations, FEES, NOW, Decimal("400")
+    )
+
+    assert scenarios[0].projected_resale_gross == Decimal("300.00")
+    assert estimate.projected_resale_gross == Decimal("270.00")
+    assert estimate.projected_proceeds == Decimal("229.50")
+    assert estimate.estimated_net_profit == Decimal("9.50")
+    assert estimate.confidence is Confidence.LOW
+    assert "seat quality unverified" in estimate.risk_reasons
+
+
 def test_more_than_ten_percent_three_snapshot_decline_receives_five_percent_haircut(candidate):
     observations = (
         comp(candidate, 1, "400", minutes=180),

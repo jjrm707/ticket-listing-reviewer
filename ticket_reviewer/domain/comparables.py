@@ -34,12 +34,21 @@ def _parking_like(value: str | None) -> bool:
     ) or label.startswith("lot ")
 
 
+def _known_label(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = normalize_label(value)
+    return normalized or None
+
+
 def comparable_weight(candidate: SourceObservation, other: SourceObservation) -> Decimal:
     """Return the exact, intentionally conservative seat-match weight."""
+    candidate_section = _known_label(candidate.section)
+    other_section = _known_label(other.section)
     if (
-        candidate.section
-        and other.section
-        and normalize_label(candidate.section) == normalize_label(other.section)
+        candidate_section is not None
+        and other_section is not None
+        and candidate_section == other_section
     ):
         if (
             candidate.row

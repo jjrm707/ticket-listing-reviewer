@@ -45,6 +45,11 @@ def comparable(price, relevance="1", quality="1"):
         ({}, {"row": "25"}, Decimal("0.80")),
         ({}, {"section": "133"}, Decimal("0.50")),
         (
+            {"section": " \t ", "row": "24"},
+            {"section": "\n", "row": "24"},
+            Decimal("0.50"),
+        ),
+        (
             {},
             {"section": None, "kind": ObservationKind.EVENT_AGGREGATE},
             Decimal("0.35"),
@@ -63,6 +68,29 @@ def test_comparable_weight_uses_exact_conservative_match_weights(
     other = observation(listing_id="other", **other_overrides)
 
     assert comparable_weight(candidate, other) == expected
+
+
+def test_blank_sections_do_not_overweight_high_asks_at_the_40th_percentile():
+    candidate = observation(listing_id="candidate", section=" \t ", row="24")
+    selected = select_comparables(
+        candidate,
+        (
+            observation(listing_id="low", pair_price=Decimal("300"), section="132"),
+            observation(
+                listing_id="high",
+                pair_price=Decimal("500"),
+                section="\n",
+                row="24",
+            ),
+        ),
+        now=NOW,
+    )
+
+    assert tuple(item.relevance for item in selected) == (
+        Decimal("0.50"),
+        Decimal("0.50"),
+    )
+    assert weighted_quantile(selected, Decimal("0.40")) == Decimal("300.00")
 
 
 def test_select_comparables_filters_unusable_evidence_and_normalizes_cents():
