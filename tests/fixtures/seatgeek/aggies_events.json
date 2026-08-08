@@ -1,0 +1,63 @@
+{
+  "events": [
+    {
+      "id": 91001,
+      "title": "LSU Tigers at Texas A&M Aggies Football",
+      "datetime_utc": "2026-10-17T23:30:00Z",
+      "url": "https://seatgeek.com/lsu-tigers-at-texas-a-m-aggies-football-tickets/college-station-texas-kyle-field-2026-10-17-6-30-pm/91001",
+      "performers": [
+        {"name": "Texas A&M Aggies Football", "slug": "texas-a-m-aggies-football"},
+        {"name": "LSU Tigers Football", "slug": "lsu-tigers-football"}
+      ],
+      "venue": {"name": "Kyle Field", "state": "TX"},
+      "stats": {
+        "lowest_price": "120.00",
+        "average_price": "175.25",
+        "highest_price": "420.00",
+        "listing_count": 850
+      },
+      "score": "0.875"
+    },
+    {
+      "id": 91002,
+      "title": "Texas A&M Aggies Football at Auburn Tigers Football",
+      "datetime_utc": "2026-10-24T23:00:00Z",
+      "url": "https://seatgeek.com/aggies-at-auburn-tickets/91002",
+      "performers": [
+        {"name": "Texas A&M Aggies Football", "slug": "texas-a-m-aggies-football"},
+        {"name": "Auburn Tigers Football", "slug": "auburn-tigers-football"}
+      ],
+      "venue": {"name": "Jordan-Hare Stadium", "state": "AL"}
+    },
+    {
+      "id": 91003,
+      "title": "Texas A&M Aggies Football vs Arkansas Razorbacks Football",
+      "datetime_utc": "2026-09-26T20:30:00Z",
+      "url": "https://seatgeek.com/aggies-razorbacks-neutral-tickets/91003",
+      "performers": [
+        {"name": "Texas A&M Aggies Football", "slug": "texas-a-m-aggies-football"},
+        {"name": "Arkansas Razorbacks Football", "slug": "arkansas-razorbacks-football"}
+      ],
+      "venue": {"name": "AT&T Stadium", "state": "TX"}
+    },
+    {
+      "id": 91004,
+      "title": "LSU Tigers at Texas A&M Aggies Football Parking Pass",
+      "datetime_utc": "2026-10-17T20:00:00Z",
+      "url": "https://seatgeek.com/aggies-parking-tickets/91004",
+      "performers": [
+        {"name": "Texas A&M Aggies Football Parking", "slug": "texas-a-m-aggies-football-parking"},
+        {"name": "LSU Tigers Football", "slug": "lsu-tigers-football"}
+      ],
+      "venue": {"name": "Kyle Field Parking Lots", "state": "TX"}
+    },
+    {
+      "id": 91005,
+      "title": "Kyle Field Summer Concert",
+      "datetime_utc": "2026-10-10T01:00:00Z",
+      "url": "https://seatgeek.com/kyle-field-concert-tickets/91005",
+      "performers": [{"name": "Sanitized Artist", "slug": "sanitized-artist"}],
+      "venue": {"name": "Kyle Field", "state": "TX"}
+    }
+  ]
+}
