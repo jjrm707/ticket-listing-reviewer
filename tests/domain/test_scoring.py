@@ -134,6 +134,40 @@ def test_exit_scenarios_apply_marketplace_fees_and_use_deterministic_ties(candid
     assert estimate.exit_source is Source.SEATGEEK
 
 
+def test_manual_only_evidence_cannot_create_an_actionable_exit(candidate):
+    observations = stable_comparables(candidate, source=Source.MANUAL)
+    fees = {Source.MANUAL: Decimal("0")}
+
+    assert estimate_exit_scenarios(candidate, observations, fees, now=NOW) == ()
+
+    estimate = estimate_opportunity(
+        candidate, observations, fees, NOW, Decimal("400")
+    )
+    assert estimate.scenarios == ()
+    assert estimate.exit_source is None
+    assert estimate.actionable is False
+
+
+def test_mixed_evidence_never_selects_manual_as_the_exit_marketplace(candidate):
+    observations = stable_comparables(candidate) + tuple(
+        comp(candidate, index, "1000", source=Source.MANUAL)
+        for index in range(4, 7)
+    )
+
+    estimate = estimate_opportunity(
+        candidate,
+        observations,
+        {Source.STUBHUB: Decimal("0.15"), Source.MANUAL: Decimal("0")},
+        NOW,
+        Decimal("400"),
+    )
+
+    assert tuple(scenario.marketplace for scenario in estimate.scenarios) == (
+        Source.STUBHUB,
+    )
+    assert estimate.exit_source is Source.STUBHUB
+
+
 @pytest.mark.parametrize(
     "fees",
     (
@@ -167,6 +201,24 @@ def test_cross_event_stale_parking_and_future_evidence_cannot_create_an_exit(can
     )
 
     assert estimate_exit_scenarios(candidate, observations, FEES, now=NOW) == ()
+
+
+def test_exit_scenarios_ignore_positive_prices_that_round_to_zero(candidate):
+    observations = (comp(candidate, 1, "0.001"),)
+
+    assert estimate_exit_scenarios(candidate, observations, FEES, now=NOW) == ()
+
+
+def test_opportunity_ignores_positive_prices_that_round_to_zero(candidate):
+    observations = (comp(candidate, 1, "0.001"),)
+
+    estimate = estimate_opportunity(
+        candidate, observations, FEES, NOW, Decimal("400")
+    )
+
+    assert estimate.scenarios == ()
+    assert estimate.exit_source is None
+    assert estimate.actionable is False
 
 
 @pytest.mark.parametrize(
@@ -220,6 +272,17 @@ def test_multiple_risk_groups_clamp_confidence_at_low(candidate):
 
     assert estimate.confidence is Confidence.LOW
     assert len(estimate.risk_reasons) == len(set(estimate.risk_reasons))
+
+
+def test_whitespace_only_row_is_unknown_seat_quality(candidate):
+    changed = replace(candidate, row=" \t ")
+
+    estimate = estimate_opportunity(
+        changed, stable_comparables(candidate), FEES, NOW, Decimal("400")
+    )
+
+    assert estimate.confidence is Confidence.MEDIUM
+    assert "seat quality unverified" in estimate.risk_reasons
 
 
 def test_missing_acquisition_costs_are_zero_only_with_explicit_uncertainty(candidate):

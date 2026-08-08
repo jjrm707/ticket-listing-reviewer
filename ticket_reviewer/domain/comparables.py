@@ -89,6 +89,9 @@ def select_comparables(
         price = observation.pair_price
         if price is None or not price.is_finite() or price <= 0:
             continue
+        basis = money(price)
+        if basis <= 0:
+            continue
         age = reference - observation.observed_at
         if age > _MAX_AGE or age < -_CLOCK_SKEW:
             continue
@@ -97,7 +100,6 @@ def select_comparables(
         if _parking_like(observation.section) or _parking_like(observation.row):
             continue
 
-        basis = money(price)
         selected.append(
             Comparable(
                 source=observation.source,

@@ -115,6 +115,13 @@ def test_event_level_evidence_has_lower_quality_than_listings():
     }
 
 
+def test_select_comparables_discards_prices_that_round_to_zero():
+    candidate = observation(listing_id="candidate")
+    subcent = observation(listing_id="subcent", pair_price=Decimal("0.001"))
+
+    assert select_comparables(candidate, (subcent,), now=NOW) == ()
+
+
 def test_optional_now_uses_newest_supplied_observation_as_reference():
     candidate = observation(listing_id="candidate")
     newest = observation(observed_at=NOW + timedelta(days=3), listing_id="newest")

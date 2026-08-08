@@ -41,6 +41,8 @@ def _build_scenarios(
 ) -> tuple[ExitScenario, ...]:
     grouped: dict[Source, list[Comparable]] = defaultdict(list)
     for comparable in comparables:
+        if comparable.source is Source.MANUAL:
+            continue
         grouped[comparable.source].append(comparable)
 
     scenarios: list[ExitScenario] = []
@@ -205,7 +207,8 @@ def estimate_opportunity(
             for comparable in comparables
         )
     )
-    if candidate.row is None or not same_section:
+    row_known = bool(candidate.row and normalize_label(candidate.row))
+    if not row_known or not same_section:
         confidence_drops += 1
         _append_unique(reasons, "seat quality unverified")
 
