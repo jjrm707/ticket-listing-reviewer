@@ -26,6 +26,26 @@ class CloseableConnector(Protocol):
     def close(self) -> None: ...
 
 
+def _close_all(resources: Iterable[CloseableConnector]) -> BaseException | None:
+    """Attempt every close and return the first failure after all attempts."""
+    first_error: BaseException | None = None
+    for resource in resources:
+        try:
+            resource.close()
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+    return first_error
+
+
+def _cleanup_without_masking(
+    original_error: BaseException, resources: Iterable[CloseableConnector]
+) -> None:
+    """Close every resource while preserving the in-flight construction error."""
+    if _close_all(resources) is not None:
+        original_error.add_note("additional owned resource cleanup failed")
+
+
 @dataclass(frozen=True, slots=True)
 class ApplicationServices:
     base_settings: Settings
@@ -43,9 +63,10 @@ class ApplicationServices:
         """Idempotently release HTTP resources created by the composition root."""
         if self._closed:
             return
-        for connector in self._owned_connectors:
-            connector.close()
         object.__setattr__(self, "_closed", True)
+        close_error = _close_all(self._owned_connectors)
+        if close_error is not None:
+            raise close_error
 
 
 def build_services(
@@ -74,8 +95,8 @@ def build_services(
                 client,
                 owns_client=True,
             )
-        except BaseException:
-            client.close()
+        except BaseException as error:
+            _cleanup_without_masking(error, (client,))
             raise
         connector_list.append(connector)
         owned_connectors.append(connector)
@@ -88,9 +109,8 @@ def build_services(
     ):
         try:
             client = httpx.Client(timeout=settings.seatgeek_http_timeout_seconds)
-        except BaseException:
-            for owned_connector in owned_connectors:
-                owned_connector.close()
+        except BaseException as error:
+            _cleanup_without_masking(error, owned_connectors)
             raise
         try:
             connector = SeatGeekConnector(
@@ -98,10 +118,8 @@ def build_services(
                 client,
                 owns_client=True,
             )
-        except BaseException:
-            client.close()
-            for owned_connector in owned_connectors:
-                owned_connector.close()
+        except BaseException as error:
+            _cleanup_without_masking(error, (client, *owned_connectors))
             raise
         connector_list.append(connector)
         owned_connectors.append(connector)
@@ -115,9 +133,8 @@ def build_services(
             alert_service=alert_service,
             clock=clock,
         )
-    except BaseException:
-        for connector in owned_connectors:
-            connector.close()
+    except BaseException as error:
+        _cleanup_without_masking(error, owned_connectors)
         raise
     return ApplicationServices(
         base_settings=settings,

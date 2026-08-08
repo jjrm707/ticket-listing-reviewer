@@ -23,6 +23,7 @@ _SEARCH_URL = "https://api.seatgeek.com/2/events"
 _DETAIL_URL = "https://api.seatgeek.com/2/events/{event_id}"
 _AGGIES_SLUG = "texas-a-m-aggies-football"
 _MAX_EVENT_ID = 9_223_372_036_854_775_807
+_MAX_EVENT_ID_DIGITS = 19
 _MAX_LISTING_COUNT = 2_147_483_647
 _PUBLIC_EVENT_HOSTS = frozenset({"seatgeek.com", "www.seatgeek.com"})
 _PRODUCT_WORDS = frozenset(
@@ -241,7 +242,9 @@ def _utc_parameter(value: datetime) -> str:
 def _search_events(payload: Any) -> list[Any]:
     if not isinstance(payload, dict):
         raise _parse_failure()
-    events = payload.get("events", [])
+    if "events" not in payload:
+        raise _parse_failure()
+    events = payload["events"]
     if not isinstance(events, list):
         raise _parse_failure()
     return events
@@ -256,14 +259,7 @@ def _parse_event(raw: Any) -> ExternalEvent | None:
     if not isinstance(title, str) or not isinstance(performers, list) or not isinstance(venue, dict):
         return None
     performer_rows = [item for item in performers if isinstance(item, dict)]
-    has_aggies_performer = any(
-        item.get("slug") == _AGGIES_SLUG
-        or (
-            isinstance(item.get("name"), str)
-            and _normalize_text(item["name"]) == "texas a m aggies football"
-        )
-        for item in performer_rows
-    )
+    has_aggies_performer = any(_is_aggies_performer(item) for item in performer_rows)
     title_norm = _normalize_text(title)
     if not has_aggies_performer or "texas a m aggies" not in title_norm:
         return None
@@ -288,21 +284,24 @@ def _parse_event(raw: Any) -> ExternalEvent | None:
     if home_match is None:
         return None
 
-    opponent = next(
-        (
-            item["name"].strip()
-            for item in performer_rows
-            if isinstance(item.get("name"), str)
-            and _normalize_text(item["name"]) != "texas a m aggies football"
-            and item["name"].strip()
-        ),
-        None,
-    )
-    if opponent is None:
-        opponent = home_match.group("opponent").strip()
+    title_opponent = home_match.group("opponent").strip()
+    opponent_performers = [
+        item for item in performer_rows if not _is_aggies_performer(item)
+    ]
+    if opponent_performers:
+        if len(opponent_performers) != 1:
+            return None
+        performer_name = opponent_performers[0].get("name")
+        if (
+            not isinstance(performer_name, str)
+            or not performer_name.strip()
+            or _opponent_identity(performer_name)
+            != _opponent_identity(title_opponent)
+        ):
+            return None
     event_id = _validated_event_id(raw.get("id"))
     if event_id is None:
-        return None
+        raise _parse_failure()
     starts_at = _parse_datetime(raw.get("datetime_utc"))
     if starts_at is None:
         raise _parse_failure()
@@ -310,7 +309,7 @@ def _parse_event(raw: Any) -> ExternalEvent | None:
         source=Source.SEATGEEK,
         external_id=event_id,
         team=Team.AGGIES,
-        opponent=opponent,
+        opponent=title_opponent,
         venue="Kyle Field",
         starts_at=starts_at,
         is_home=True,
@@ -323,19 +322,48 @@ def _normalize_text(value: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
 
 
+def _is_aggies_performer(raw: dict[str, Any]) -> bool:
+    return raw.get("slug") == _AGGIES_SLUG or (
+        isinstance(raw.get("name"), str)
+        and _normalize_text(raw["name"]) == "texas a m aggies football"
+    )
+
+
+def _opponent_identity(value: str) -> str:
+    normalized = _normalize_text(value)
+    return normalized.removesuffix(" football").strip()
+
+
 def _has_product_signal(signals: list[str]) -> bool:
     return any(
-        token in _PRODUCT_WORDS
+        _is_product_token(token)
         for signal in signals
         for token in re.findall(r"[a-z0-9]+", signal.casefold())
     )
 
 
+def _is_product_token(token: str) -> bool:
+    if token in _PRODUCT_WORDS or "parking" in token or "tailgat" in token:
+        return True
+    return "pass" in token and not token.startswith(("compassion", "passenger"))
+
+
 def _validated_event_id(raw: Any) -> str | None:
     if type(raw) is int:
         value = raw
-    elif isinstance(raw, str) and raw.strip().isascii() and raw.strip().isdigit():
-        value = int(raw.strip())
+    elif isinstance(raw, str):
+        digits = raw.strip()
+        if (
+            not digits
+            or len(digits) > _MAX_EVENT_ID_DIGITS
+            or not digits.isascii()
+            or not digits.isdigit()
+        ):
+            return None
+        try:
+            value = int(digits)
+        except (ValueError, OverflowError):
+            return None
     else:
         return None
     if not 0 < value <= _MAX_EVENT_ID:

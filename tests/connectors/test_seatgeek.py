@@ -64,7 +64,7 @@ def sg_event():
         source=Source.SEATGEEK,
         external_id="91001",
         team=Team.AGGIES,
-        opponent="LSU Tigers Football",
+        opponent="LSU Tigers",
         venue="Kyle Field",
         starts_at=datetime(2026, 10, 17, 23, 30, tzinfo=timezone.utc),
         is_home=True,
@@ -120,7 +120,7 @@ def test_maps_only_aggies_home_game_at_kyle(connector, fixture_json):
             source=Source.SEATGEEK,
             external_id="91001",
             team=Team.AGGIES,
-            opponent="LSU Tigers Football",
+            opponent="LSU Tigers",
             venue="Kyle Field",
             starts_at=datetime(2026, 10, 17, 23, 30, tzinfo=timezone.utc),
             is_home=True,
@@ -213,6 +213,52 @@ def test_rejects_away_neutral_parking_and_unrelated_events(
     assert connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END) == []
 
 
+@pytest.mark.parametrize(
+    ("location", "signal"),
+    [
+        ("opponent", "LSU VIPPass"),
+        ("opponent", "LSU ParkingPass"),
+        ("performer", "LSU Tigers Passholder"),
+        ("performer", "LSU Tigers TailgatePass"),
+        ("venue", "SeasonPassHolder"),
+    ],
+)
+@respx.mock
+def test_concatenated_pass_like_product_signals_are_rejected(
+    connector, fixture_json, location, signal
+):
+    event = detail_payload(fixture_json)
+    if location == "opponent":
+        event["title"] = f"{signal} at Texas A&M Aggies Football"
+        event["performers"][1]["name"] = signal
+    elif location == "performer":
+        event["performers"][1]["name"] = signal
+    else:
+        event["venue"]["access_label"] = signal
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"events": [event]})
+    )
+
+    assert connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END) == []
+
+
+@pytest.mark.parametrize("opponent", ["Compassion Bears", "Passenger State"])
+@respx.mock
+def test_pass_substrings_in_non_product_words_remain_accepted(
+    connector, fixture_json, opponent
+):
+    event = detail_payload(fixture_json)
+    event["title"] = f"{opponent} at Texas A&M Aggies Football"
+    event["performers"][1]["name"] = opponent
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"events": [event]})
+    )
+
+    discovered = connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END)
+
+    assert discovered[0].opponent == opponent
+
+
 @respx.mock
 def test_accepts_conservative_aggies_home_vs_and_dedupes_sorts(connector, fixture_json):
     base = detail_payload(fixture_json)
@@ -232,7 +278,7 @@ def test_accepts_conservative_aggies_home_vs_and_dedupes_sorts(connector, fixtur
 
     assert [(event.external_id, event.opponent) for event in events] == [
         ("91002", "Alabama Crimson Tide"),
-        ("91001", "LSU Tigers Football"),
+        ("91001", "LSU Tigers"),
         ("91003", "Auburn Tigers Football"),
     ]
 
@@ -313,6 +359,44 @@ def test_invalid_numeric_event_id_is_safe_parse_without_network(connector, sg_ev
 
 
 @respx.mock
+def test_huge_numeric_event_id_is_bounded_before_integer_conversion(
+    connector, sg_event
+):
+    attacker_id = "9" * 100_000
+    event = replace(sg_event, external_id=attacker_id)
+
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.fetch_observations(event)
+
+    assert caught.value.category is FailureCategory.PARSE
+    assert caught.value.retryable is False
+    assert attacker_id[:100] not in f"{caught.value!s} {caught.value!r}"
+    assert respx.calls.call_count == 0
+
+
+@pytest.mark.parametrize(
+    "bad_id", ["", "not-a-number", "9" * 100_000], ids=["blank", "invalid", "huge"]
+)
+@respx.mock
+def test_discovery_rejects_qualifying_event_with_invalid_id_safely(
+    connector, fixture_json, bad_id
+):
+    event = detail_payload(fixture_json)
+    event["id"] = bad_id
+    route = respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"events": [event]})
+    )
+
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END)
+
+    assert caught.value.category is FailureCategory.PARSE
+    assert caught.value.retryable is False
+    assert route.call_count == 1
+    assert "not-a-number" not in f"{caught.value!s} {caught.value!r}"
+
+
+@respx.mock
 def test_maps_aggies_event_aggregates(connector, fixture_json, sg_event):
     route = respx.get(DETAIL_URL).mock(
         return_value=httpx.Response(200, json=detail_payload(fixture_json))
@@ -352,6 +436,50 @@ def test_detail_revalidates_same_aggies_home_kyle_event(connector, fixture_json,
 
     assert caught.value.category is FailureCategory.PARSE
     assert caught.value.retryable is False
+
+
+@pytest.mark.parametrize(
+    "performers",
+    [
+        [
+            {"name": "Texas A&M Aggies Football", "slug": "texas-a-m-aggies-football"},
+            {"name": "Alabama Crimson Tide", "slug": "alabama-crimson-tide"},
+        ],
+        [
+            {"name": "Texas A&M Aggies Football", "slug": "texas-a-m-aggies-football"},
+            {"name": "LSU Tigers Football", "slug": "lsu-tigers-football"},
+            {"name": "Alabama Crimson Tide", "slug": "alabama-crimson-tide"},
+        ],
+    ],
+)
+@respx.mock
+def test_discovery_rejects_mismatched_or_ambiguous_opponent_performers(
+    connector, fixture_json, performers
+):
+    event = detail_payload(fixture_json)
+    event["performers"] = performers
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"events": [event]})
+    )
+
+    assert connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END) == []
+
+
+@pytest.mark.parametrize("with_opponent_performer", [True, False])
+@respx.mock
+def test_title_is_canonical_when_optional_performer_agrees(
+    connector, fixture_json, with_opponent_performer
+):
+    event = detail_payload(fixture_json)
+    if not with_opponent_performer:
+        event["performers"] = [event["performers"][0]]
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"events": [event]})
+    )
+
+    discovered = connector.discover(Team.AGGIES, WINDOW_START, WINDOW_END)
+
+    assert discovered[0].opponent == "LSU Tigers"
 
 
 @pytest.mark.parametrize(
@@ -480,6 +608,8 @@ def test_network_failure_retries_without_raw_exception(client):
     [
         httpx.Response(200, content=b"not-json private"),
         httpx.Response(200, json=[]),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"meta": {"page": 1}}),
         httpx.Response(200, json={"events": {}}),
     ],
 )
@@ -619,6 +749,140 @@ def test_bootstrap_closes_first_owned_client_when_second_client_construction_fai
         )
 
     assert first.close_calls == 1
+
+
+def test_application_close_attempts_seatgeek_after_ticketmaster_close_raises(
+    monkeypatch,
+):
+    services = build_services(
+        Settings(
+            _env_file=None,
+            ticketmaster_api_key="ticketmaster-key",
+            seatgeek_client_id=CLIENT_ID,
+        ),
+        session_factory=lambda: None,
+    )
+    ticketmaster, seatgeek = services.connectors
+    cleanup_error = RuntimeError("sanitized ticketmaster close failure")
+
+    def failing_close():
+        raise cleanup_error
+
+    monkeypatch.setattr(ticketmaster, "close", failing_close)
+
+    with pytest.raises(RuntimeError) as caught:
+        services.close()
+
+    assert caught.value is cleanup_error
+    assert seatgeek.client.is_closed is True
+    services.close()
+
+
+def test_scanner_failure_preserves_original_error_and_closes_seatgeek_when_ticketmaster_close_raises(
+    monkeypatch,
+):
+    clients = []
+
+    class ClientDouble:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def client_factory(**_kwargs):
+        value = ClientDouble()
+        clients.append(value)
+        return value
+
+    original_close = __import__(
+        "ticket_reviewer.connectors.ticketmaster", fromlist=["TicketmasterConnector"]
+    ).TicketmasterConnector.close
+
+    def failing_ticketmaster_close(self):
+        original_close(self)
+        raise RuntimeError("sanitized ticketmaster cleanup failure")
+
+    class Injected:
+        source = Source.STUBHUB
+        capabilities = frozenset({Capability.EVENT_SEARCH})
+
+        def discover(self, *_args):
+            return []
+
+        def fetch_observations(self, _event):
+            return []
+
+    monkeypatch.setattr("ticket_reviewer.bootstrap.httpx.Client", client_factory)
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.TicketmasterConnector.close",
+        failing_ticketmaster_close,
+    )
+
+    with pytest.raises(ValueError, match="duplicate connector source") as caught:
+        build_services(
+            Settings(
+                _env_file=None,
+                ticketmaster_api_key="ticketmaster-key",
+                seatgeek_client_id=CLIENT_ID,
+            ),
+            connectors=(Injected(), Injected()),
+            session_factory=lambda: None,
+        )
+
+    assert [client.close_calls for client in clients] == [1, 1]
+    assert any("cleanup failed" in note for note in getattr(caught.value, "__notes__", ()))
+
+
+def test_connector_construction_failure_is_not_masked_when_prior_cleanup_raises(
+    monkeypatch,
+):
+    clients = []
+
+    class ClientDouble:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def client_factory(**_kwargs):
+        value = ClientDouble()
+        clients.append(value)
+        return value
+
+    original_close = __import__(
+        "ticket_reviewer.connectors.ticketmaster", fromlist=["TicketmasterConnector"]
+    ).TicketmasterConnector.close
+
+    def failing_ticketmaster_close(self):
+        original_close(self)
+        raise RuntimeError("sanitized ticketmaster cleanup failure")
+
+    def fail_seatgeek_construction(*_args, **_kwargs):
+        raise ValueError("sanitized SeatGeek construction failure")
+
+    monkeypatch.setattr("ticket_reviewer.bootstrap.httpx.Client", client_factory)
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.TicketmasterConnector.close",
+        failing_ticketmaster_close,
+    )
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.SeatGeekConnector", fail_seatgeek_construction
+    )
+
+    with pytest.raises(ValueError, match="SeatGeek construction failure") as caught:
+        build_services(
+            Settings(
+                _env_file=None,
+                ticketmaster_api_key="ticketmaster-key",
+                seatgeek_client_id=CLIENT_ID,
+            ),
+            session_factory=lambda: None,
+        )
+
+    assert [client.close_calls for client in clients] == [1, 1]
+    assert any("cleanup failed" in note for note in getattr(caught.value, "__notes__", ()))
 
 
 @respx.mock
