@@ -10,7 +10,7 @@ def _require_timezone_aware(value: datetime, field_name: str) -> None:
         raise ValueError(f"{field_name} must be timezone-aware")
 
 
-def _require_non_negative(value: Decimal | int | None, field_name: str) -> None:
+def _require_non_negative(value: Decimal | None, field_name: str) -> None:
     if value is not None and value < 0:
         raise ValueError(f"{field_name} must be non-negative")
 
@@ -18,6 +18,15 @@ def _require_non_negative(value: Decimal | int | None, field_name: str) -> None:
 def _require_decimal(value: Decimal | None, field_name: str) -> None:
     if value is not None and not isinstance(value, Decimal):
         raise ValueError(f"{field_name} must be a Decimal")
+    if value is not None and not value.is_finite():
+        raise ValueError(f"{field_name} must be a finite Decimal")
+
+
+def _require_non_negative_int(value: int | None, field_name: str) -> None:
+    if value is not None and type(value) is not int:
+        raise ValueError(f"{field_name} must be an int")
+    if value is not None and value < 0:
+        raise ValueError(f"{field_name} must be non-negative")
 
 
 def _require_rate(value: Decimal | None, field_name: str) -> None:
@@ -70,8 +79,8 @@ class SourceObservation:
         _require_non_negative(self.pair_price, "pair_price")
         _require_non_negative(self.buyer_fees, "buyer_fees")
         _require_non_negative(self.estimated_tax, "estimated_tax")
-        _require_non_negative(self.quantity_available, "quantity_available")
-        _require_non_negative(self.listing_count, "listing_count")
+        _require_non_negative_int(self.quantity_available, "quantity_available")
+        _require_non_negative_int(self.listing_count, "listing_count")
         _require_non_negative(self.popularity, "popularity")
 
 
@@ -118,7 +127,7 @@ class ExitScenario:
         _require_non_negative(self.projected_resale_gross, "projected_resale_gross")
         _require_rate(self.seller_fee_rate, "seller_fee_rate")
         _require_non_negative(self.projected_proceeds, "projected_proceeds")
-        _require_non_negative(self.comparable_count, "comparable_count")
+        _require_non_negative_int(self.comparable_count, "comparable_count")
 
 
 @dataclass(frozen=True, slots=True)
