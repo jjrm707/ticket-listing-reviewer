@@ -31,6 +31,22 @@ class CloseableConnector(Protocol):
     def close(self) -> None: ...
 
 
+class DisposableEngine(Protocol):
+    def dispose(self) -> None: ...
+
+
+@dataclass(slots=True)
+class _OwnedEngine:
+    engine: DisposableEngine
+    closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        self.engine.dispose()
+
+
 def _close_all(resources: Iterable[CloseableConnector]) -> BaseException | None:
     """Attempt every close and return the first failure after all attempts."""
     first_error: BaseException | None = None
@@ -74,7 +90,7 @@ class ApplicationServices:
     connectors: tuple[MarketplaceConnector, ...]
     scanner: ScanCoordinator
     alert_service: ScannerAlertService | None
-    _owned_connectors: tuple[CloseableConnector, ...] = field(
+    _owned_resources: tuple[CloseableConnector, ...] = field(
         default=(), repr=False
     )
     _closed: bool = field(default=False, repr=False, compare=False)
@@ -84,7 +100,7 @@ class ApplicationServices:
         if self._closed:
             return
         object.__setattr__(self, "_closed", True)
-        close_error = _close_all(self._owned_connectors)
+        close_error = _close_all(self._owned_resources)
         if close_error is not None:
             raise close_error
 
@@ -99,8 +115,6 @@ def build_services(
     clock: Callable[[], datetime] | None = None,
 ) -> ApplicationServices:
     """Wire local services and configured official public connectors."""
-    if session_factory is None:
-        _, session_factory = create_engine_and_session(settings.database_url)
     connector_list = list(connectors)
     connector_sources = _snapshot_connector_sources(connector_list)
     topic_secret = settings.ntfy_topic
@@ -132,29 +146,40 @@ def build_services(
     )
     if bool(configured_stubhub_client_id) != bool(configured_stubhub_client_secret):
         raise ValueError("StubHub OAuth credentials must be configured together")
-    owned_connectors: list[CloseableConnector] = []
+    key = settings.ticketmaster_api_key
+    configured_key = key.get_secret_value().strip() if key is not None else ""
+    client_id = settings.seatgeek_client_id
+    configured_client_id = (
+        client_id.get_secret_value().strip() if client_id is not None else ""
+    )
+    owned_resources: list[CloseableConnector] = []
+    if session_factory is None:
+        engine, session_factory = create_engine_and_session(settings.database_url)
+        owned_resources.append(_OwnedEngine(engine))
     effective_alert_service = alert_service
     if configured_topic and effective_alert_service is None:
-        publisher = NtfyPublisher(
-            configured_topic,
-            token,
-            settings.ntfy_http_timeout_seconds,
-        )
-        owned_connectors.append(publisher)
+        try:
+            publisher = NtfyPublisher(
+                configured_topic,
+                token,
+                settings.ntfy_http_timeout_seconds,
+            )
+        except BaseException as error:
+            _cleanup_without_masking(error, owned_resources)
+            raise
+        owned_resources.append(publisher)
         try:
             effective_alert_service = OpportunityAlertService(
                 settings, session_factory, publisher=publisher
             )
         except BaseException as error:
-            _cleanup_without_masking(error, owned_connectors)
+            _cleanup_without_masking(error, owned_resources)
             raise
-    key = settings.ticketmaster_api_key
-    configured_key = key.get_secret_value().strip() if key is not None else ""
     if configured_key and Source.TICKETMASTER not in connector_sources:
         try:
             client = httpx.Client(timeout=settings.ticketmaster_http_timeout_seconds)
         except BaseException as error:
-            _cleanup_without_masking(error, owned_connectors)
+            _cleanup_without_masking(error, owned_resources)
             raise
         try:
             connector = TicketmasterConnector(
@@ -163,20 +188,16 @@ def build_services(
                 owns_client=True,
             )
         except BaseException as error:
-            _cleanup_without_masking(error, (client, *owned_connectors))
+            _cleanup_without_masking(error, (client, *owned_resources))
             raise
         connector_list.append(connector)
         connector_sources.append(Source.TICKETMASTER)
-        owned_connectors.append(connector)
-    client_id = settings.seatgeek_client_id
-    configured_client_id = (
-        client_id.get_secret_value().strip() if client_id is not None else ""
-    )
+        owned_resources.append(connector)
     if configured_client_id and Source.SEATGEEK not in connector_sources:
         try:
             client = httpx.Client(timeout=settings.seatgeek_http_timeout_seconds)
         except BaseException as error:
-            _cleanup_without_masking(error, owned_connectors)
+            _cleanup_without_masking(error, owned_resources)
             raise
         try:
             connector = SeatGeekConnector(
@@ -185,11 +206,11 @@ def build_services(
                 owns_client=True,
             )
         except BaseException as error:
-            _cleanup_without_masking(error, (client, *owned_connectors))
+            _cleanup_without_masking(error, (client, *owned_resources))
             raise
         connector_list.append(connector)
         connector_sources.append(Source.SEATGEEK)
-        owned_connectors.append(connector)
+        owned_resources.append(connector)
     if (
         configured_stubhub_client_id
         and configured_stubhub_client_secret
@@ -198,7 +219,7 @@ def build_services(
         try:
             client = httpx.Client(timeout=settings.stubhub_http_timeout_seconds)
         except BaseException as error:
-            _cleanup_without_masking(error, owned_connectors)
+            _cleanup_without_masking(error, owned_resources)
             raise
         try:
             connector = StubHubConnector(
@@ -207,11 +228,11 @@ def build_services(
                 owns_client=True,
             )
         except BaseException as error:
-            _cleanup_without_masking(error, (client, *owned_connectors))
+            _cleanup_without_masking(error, (client, *owned_resources))
             raise
         connector_list.append(connector)
         connector_sources.append(Source.STUBHUB)
-        owned_connectors.append(connector)
+        owned_resources.append(connector)
     connector_tuple = tuple(connector_list)
     try:
         scanner = ScanCoordinator(
@@ -224,7 +245,7 @@ def build_services(
             clock=clock,
         )
     except BaseException as error:
-        _cleanup_without_masking(error, owned_connectors)
+        _cleanup_without_masking(error, owned_resources)
         raise
     return ApplicationServices(
         base_settings=settings,
@@ -233,5 +254,5 @@ def build_services(
         connectors=connector_tuple,
         scanner=scanner,
         alert_service=effective_alert_service,
-        _owned_connectors=tuple(owned_connectors),
+        _owned_resources=tuple(owned_resources),
     )

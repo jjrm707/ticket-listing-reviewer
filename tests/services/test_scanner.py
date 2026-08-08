@@ -728,3 +728,120 @@ def test_build_services_accepts_injected_fakes_without_calling_connectors(settin
     assert services.scanner.connectors == (connector,)
     assert connector.discover_calls == []
     assert services.alert_service is None
+
+
+def test_build_services_disposes_the_database_engine_it_creates_once(
+    monkeypatch, settings
+):
+    class Engine:
+        def __init__(self):
+            self.dispose_calls = 0
+
+        def dispose(self):
+            self.dispose_calls += 1
+
+    engine = Engine()
+    session_factory = lambda: None
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.create_engine_and_session",
+        lambda _database_url: (engine, session_factory),
+    )
+
+    services = build_services(settings)
+    services.close()
+    services.close()
+
+    assert engine.dispose_calls == 1
+
+
+def test_build_services_never_disposes_an_injected_session_factory_engine(
+    monkeypatch, settings
+):
+    class CallerEngine:
+        def dispose(self):
+            raise AssertionError("caller-owned engine must not be disposed")
+
+    class CallerSessionFactory:
+        bind = CallerEngine()
+
+        def __call__(self):
+            return None
+
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.create_engine_and_session",
+        lambda _database_url: (_ for _ in ()).throw(
+            AssertionError("injected session factory must be reused")
+        ),
+    )
+
+    services = build_services(settings, session_factory=CallerSessionFactory())
+    services.close()
+
+
+def test_service_close_disposes_owned_engine_even_when_an_http_close_fails(
+    monkeypatch, settings
+):
+    class Engine:
+        def __init__(self):
+            self.dispose_calls = 0
+
+        def dispose(self):
+            self.dispose_calls += 1
+
+    class Client:
+        def post(self, *_args, **_kwargs):
+            raise AssertionError("no request expected")
+
+        def close(self):
+            raise RuntimeError("sanitized client close failure")
+
+    engine = Engine()
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.create_engine_and_session",
+        lambda _database_url: (engine, lambda: None),
+    )
+    monkeypatch.setattr("ticket_reviewer.bootstrap.httpx.Client", lambda **_kwargs: Client())
+    configured = Settings(
+        _env_file=None,
+        database_url=settings.database_url,
+        ntfy_topic="Task11EngineClose_7K3mP9vR2xQ8wL5z",
+    )
+    services = build_services(configured)
+
+    with pytest.raises(RuntimeError, match="sanitized client close failure"):
+        services.close()
+
+    assert engine.dispose_calls == 1
+
+
+def test_publisher_construction_failure_disposes_owned_engine_without_masking_error(
+    monkeypatch, settings
+):
+    class Engine:
+        def __init__(self):
+            self.dispose_calls = 0
+
+        def dispose(self):
+            self.dispose_calls += 1
+
+    engine = Engine()
+    failure = RuntimeError("sanitized publisher construction failure")
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.create_engine_and_session",
+        lambda _database_url: (engine, lambda: None),
+    )
+    monkeypatch.setattr(
+        "ticket_reviewer.bootstrap.NtfyPublisher.__init__",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(failure),
+    )
+    configured = Settings(
+        _env_file=None,
+        database_url=settings.database_url,
+        ntfy_topic="Task11PublisherFailure_7K3mP9vR2xQ8wL5z",
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        build_services(configured)
+
+    assert caught.value is failure
+    assert engine.dispose_calls == 1
