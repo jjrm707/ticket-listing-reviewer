@@ -113,7 +113,9 @@ def test_migrated_schema_matches_orm_metadata(tmp_path):
 
     try:
         with engine.connect() as connection:
-            context = MigrationContext.configure(connection)
+            context = MigrationContext.configure(
+                connection, opts={"compare_server_default": True}
+            )
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()

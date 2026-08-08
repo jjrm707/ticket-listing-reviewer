@@ -14,6 +14,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 from sqlalchemy.types import TypeDecorator
@@ -62,9 +63,14 @@ class EventRow(Base):
     venue: Mapped[str] = mapped_column(String(255), nullable=False)
     starts_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     is_home: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), default=utc_now, onupdate=utc_now
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
     )
 
 
@@ -119,7 +125,9 @@ class ObservationRow(Base):
     listing_count: Mapped[int | None] = mapped_column(Integer)
     popularity: Mapped[Decimal | None] = mapped_column(Numeric(12, 4))
     freshness_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
 
 
 class OpportunityRow(Base):
@@ -142,11 +150,18 @@ class OpportunityRow(Base):
     confidence: Mapped[str] = mapped_column(String(32), nullable=False)
     risk_reasons: Mapped[list[str]] = mapped_column(JSON, nullable=False)
     actionable: Mapped[bool] = mapped_column(Boolean, nullable=False)
-    status: Mapped[str] = mapped_column(String(32), nullable=False, default="new")
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="new", server_default="new"
+    )
     scenarios: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
-    created_at: Mapped[datetime] = mapped_column(UTCDateTime(), default=utc_now)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=utc_now, server_default=text("CURRENT_TIMESTAMP")
+    )
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), default=utc_now, onupdate=utc_now
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
     )
 
 
@@ -180,7 +195,10 @@ class OutcomeRow(Base):
     actual_fees: Mapped[Decimal | None] = mapped_column(Numeric(12, 2))
     notes: Mapped[str | None] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), default=utc_now, onupdate=utc_now
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
     )
 
 
@@ -192,7 +210,9 @@ class ConnectorRunRow(Base):
     started_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
     finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     success: Mapped[bool | None] = mapped_column(Boolean)
-    observation_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    observation_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     redacted_error: Mapped[str | None] = mapped_column(Text)
 
 
@@ -202,7 +222,10 @@ class SettingRow(Base):
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
-        UTCDateTime(), default=utc_now, onupdate=utc_now
+        UTCDateTime(),
+        default=utc_now,
+        onupdate=utc_now,
+        server_default=text("CURRENT_TIMESTAMP"),
     )
 
 

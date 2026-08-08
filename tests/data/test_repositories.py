@@ -231,8 +231,10 @@ def test_setting_rejects_unknown_and_secret_keys(session, key):
         ("profit_improvement_threshold", "-0.01"),
         ("observation_freshness_minutes", "59"),
         ("observation_freshness_minutes", "1441"),
+        ("observation_freshness_minutes", Decimal("60.9")),
         ("scan_interval_minutes", "30"),
         ("scan_interval_minutes", "61"),
+        ("scan_interval_minutes", Decimal("60.9")),
         ("stubhub_seller_fee_rate", "0.5001"),
         ("ticketmaster_seller_fee_rate", "-0.01"),
         ("seatgeek_seller_fee_rate", "0.51"),
@@ -365,21 +367,47 @@ def test_connector_run_finish_records_result_and_redacts_error(session):
 
 
 @pytest.mark.parametrize(
-    ("raw_error", "secret"),
+    ("raw_error", "secrets"),
     [
-        ('body={"access_token": "json-secret"}', "json-secret"),
-        ("payload={'client_secret': 'dict-secret'}", "dict-secret"),
-        ("Authorization: Basic basic-secret", "basic-secret"),
-        ("headers={'Authorization': 'Basic python-auth-secret'}", "python-auth-secret"),
-        ('headers={"Authorization": "Basic json-auth-secret"}', "json-auth-secret"),
-        ("url=https://user:url-secret@example.test/path", "url-secret"),
-        ("url=https://example.test/path?api_key=query-secret", "query-secret"),
-        ("headers={'Cookie': 'session=python-cookie-secret'}", "python-cookie-secret"),
-        ('headers={"Set-Cookie": "session=json-cookie-secret"}', "json-cookie-secret"),
+        ('body={"access_token": "json-secret"}', ("json-secret",)),
+        ("payload={'client_secret': 'dict-secret'}", ("dict-secret",)),
+        ("Authorization: Basic basic-secret", ("basic-secret",)),
+        (
+            'Authorization: Digest username="digest-user", realm="digest-realm", '
+            'response="digest-response"',
+            ("digest-user", "digest-realm", "digest-response"),
+        ),
+        (
+            "headers={'Authorization': 'Digest username=\"quoted-user\", "
+            "response=\"quoted-response\"'}",
+            ("quoted-user", "quoted-response"),
+        ),
+        ("headers={'Authorization': 'Basic python-auth-secret'}", ("python-auth-secret",)),
+        ('headers={"Authorization": "Basic json-auth-secret"}', ("json-auth-secret",)),
+        ("url=https://user:url-secret@example.test/path", ("url-secret",)),
+        ("url=https://example.test/path?api_key=query-secret", ("query-secret",)),
+        (
+            "Cookie: session=bare-cookie-one; csrf=bare-cookie-two",
+            ("bare-cookie-one", "bare-cookie-two"),
+        ),
+        (
+            "Set-Cookie: session=set-cookie-one; Path=/, csrf=set-cookie-two; Secure",
+            ("set-cookie-one", "set-cookie-two"),
+        ),
+        (
+            "headers={'Cookie': 'session=python-cookie-secret; "
+            "csrf=python-csrf-secret'}",
+            ("python-cookie-secret", "python-csrf-secret"),
+        ),
+        (
+            'headers={"Set-Cookie": "session=json-cookie-secret; Path=/, '
+            'csrf=json-csrf-secret"}',
+            ("json-cookie-secret", "json-csrf-secret"),
+        ),
     ],
 )
 def test_connector_run_never_persists_common_raw_secret_forms(
-    session, raw_error, secret
+    session, raw_error, secrets
 ):
     repository = RunRepository(session)
     run_id = repository.start(Source.TICKETMASTER)
@@ -393,7 +421,7 @@ def test_connector_run_never_persists_common_raw_secret_forms(
 
     stored = repository.get(run_id).redacted_error
     assert "[REDACTED]" in stored
-    assert secret not in stored
+    assert all(secret not in stored for secret in secrets)
 
 
 def test_missing_listing_identity_cannot_collide_with_real_listing_id(

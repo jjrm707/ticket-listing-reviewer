@@ -397,7 +397,12 @@ class SettingRepository:
             if isinstance(value, bool):
                 raise ValueError
             candidate = dict(_VALID_RUNTIME_BASE)
-            candidate[key] = int(value) if key in _INTEGER_RUNTIME_FIELDS else value
+            if key in _INTEGER_RUNTIME_FIELDS:
+                if isinstance(value, Decimal) and value != value.to_integral_value():
+                    raise ValueError
+                candidate[key] = int(value)
+            else:
+                candidate[key] = value
             validated = RuntimeSettings.model_validate(candidate)
             return getattr(validated, key)
         except (ValidationError, ValueError):
@@ -418,13 +423,13 @@ _BEARER_SECRET = re.compile(r"(?i)\b(bearer\s+)([^\s,;]+)")
 _AUTHORIZATION_SECRET = re.compile(
     r'''(?ix)
     (?P<prefix>["']?authorization["']?\s*[:=]\s*)
-    (?:"[^"]*"|'[^']*'|[^\r\n,;}]+)
+    (?:"[^"]*"|'[^']*'|[^\r\n]+)
     '''
 )
 _COOKIE_SECRET = re.compile(
     r'''(?ix)
     (?P<prefix>["']?(?:set-)?cookie["']?\s*[:=]\s*)
-    (?:"[^"]*"|'[^']*'|[^\r\n,;}]+)
+    (?:"[^"]*"|'[^']*'|[^\r\n]+)
     '''
 )
 _URL_USERINFO_SECRET = re.compile(r"(://)[^/\s:@]+:[^/@\s]+@")
