@@ -282,6 +282,34 @@ class AlertRepository:
             select(AlertRow).where(AlertRow.fingerprint == fingerprint)
         )
 
+    def find_successful_by_fingerprint(self, fingerprint: str) -> AlertRow | None:
+        return self.session.scalar(
+            select(AlertRow).where(
+                AlertRow.fingerprint == fingerprint,
+                AlertRow.provider_message_id.is_not(None),
+                AlertRow.provider_message_id != "",
+            )
+        )
+
+    def latest_for_lineage(
+        self, source: str, event_external_id: str, listing_identity: str
+    ) -> AlertRow | None:
+        """Return the latest successful alert for one stable listing lineage."""
+        return self.session.scalar(
+            select(AlertRow)
+            .join(OpportunityRow, AlertRow.opportunity_id == OpportunityRow.id)
+            .join(ObservationRow, OpportunityRow.observation_id == ObservationRow.id)
+            .where(
+                ObservationRow.source == source,
+                ObservationRow.event_external_id == event_external_id,
+                ObservationRow.listing_identity == listing_identity,
+                AlertRow.provider_message_id.is_not(None),
+                AlertRow.provider_message_id != "",
+            )
+            .order_by(AlertRow.sent_at.desc(), AlertRow.id.desc())
+            .limit(1)
+        )
+
     def record(
         self,
         opportunity_id: int,
@@ -292,6 +320,12 @@ class AlertRepository:
     ) -> int:
         existing = self.find_by_fingerprint(fingerprint)
         if existing is not None:
+            if not existing.provider_message_id:
+                existing.opportunity_id = opportunity_id
+                existing.sent_at = sent_at
+                existing.profit_at_send = profit_at_send
+                existing.provider_message_id = provider_message_id
+                self.session.flush()
             return existing.id
         row = AlertRow(
             opportunity_id=opportunity_id,

@@ -12,6 +12,7 @@ from ticket_reviewer.connectors.base import Capability, ConnectorFailure, Failur
 from ticket_reviewer.data.db import create_engine_and_session
 from ticket_reviewer.data.repositories import EventRepository, ObservationRepository, SettingRepository
 from ticket_reviewer.data.schema import (
+    AlertRow,
     Base,
     ConnectorRunRow,
     EventRow,
@@ -19,6 +20,7 @@ from ticket_reviewer.data.schema import (
     OpportunityRow,
 )
 from ticket_reviewer.domain.enums import ObservationKind, Source, Team
+from ticket_reviewer.services.alerts import AlertService, NotificationFailure
 from ticket_reviewer.services.scanner import RepositoryBundle, ScanCoordinator
 
 
@@ -520,6 +522,192 @@ def test_alert_service_receives_only_fresh_actionable_estimates(settings, databa
     assert summary.actionable_opportunities == 1
     assert len(alerts.calls) == 1
     assert alerts.calls[0][1] == NOW
+
+
+def test_opportunity_commits_before_alert_evaluation(settings, database):
+    class Alerts:
+        committed_opportunity_id = None
+
+        def evaluate_and_send(self, opportunity_id, now):
+            with database() as session:
+                assert session.get(OpportunityRow, opportunity_id) is not None
+            self.committed_opportunity_id = opportunity_id
+
+    event = one_event()
+    candidate = one_observation(
+        listing_id="candidate",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    comps = [
+        comparable_observation(
+            pair_price=Decimal("300"), observed_at=NOW - timedelta(seconds=i)
+        )
+        for i in range(3)
+    ]
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {"event-1": [candidate, *comps]},
+    )
+    alerts = Alerts()
+
+    summary = coordinator(
+        settings, database, (connector,), alert_service=alerts
+    ).run(NOW)
+
+    assert summary.sources_succeeded == (Source.STUBHUB,)
+    assert alerts.committed_opportunity_id is not None
+
+
+def test_notification_failure_does_not_fail_or_rollback_connector_scan(
+    settings, database
+):
+    class Alerts:
+        def evaluate_and_send(self, opportunity_id, now):
+            raise RuntimeError("notification boundary failed")
+
+    event = one_event()
+    candidate = one_observation(
+        listing_id="candidate",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    comps = [
+        comparable_observation(
+            pair_price=Decimal("300"), observed_at=NOW - timedelta(seconds=i)
+        )
+        for i in range(3)
+    ]
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {"event-1": [candidate, *comps]},
+    )
+
+    summary = coordinator(
+        settings, database, (connector,), alert_service=Alerts()
+    ).run(NOW)
+
+    assert summary.sources_succeeded == (Source.STUBHUB,)
+    assert summary.sources_failed == ()
+    with database() as session:
+        assert len(session.scalars(select(OpportunityRow)).all()) == 1
+        runs = session.scalars(select(ConnectorRunRow)).all()
+        assert len(runs) == 1
+        assert runs[0].success is True
+
+
+def test_real_alert_service_commits_dedupes_and_retries_without_failing_scan(
+    settings, database
+):
+    event = one_event()
+    first_candidate = one_observation(
+        listing_id="candidate-1",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    comps = [
+        comparable_observation(
+            pair_price=Decimal("300"), observed_at=NOW - timedelta(seconds=i)
+        )
+        for i in range(3)
+    ]
+    first_connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {"event-1": [first_candidate, *comps]},
+    )
+
+    first_summary = coordinator(
+        settings,
+        database,
+        (first_connector,),
+        alert_service=AlertService(settings, database),
+    ).run(NOW)
+
+    assert first_summary.sources_succeeded == (Source.STUBHUB,)
+    with database() as session:
+        first_opportunity = session.scalars(
+            select(OpportunityRow).order_by(OpportunityRow.id)
+        ).one()
+        first_alert = session.scalars(select(AlertRow)).one()
+        assert first_alert.opportunity_id == first_opportunity.id
+        assert first_alert.provider_message_id == "dry-run"
+        assert session.scalars(select(ConnectorRunRow)).one().success is True
+
+    restarted = AlertService(settings, database).evaluate_and_send(
+        first_opportunity.id, NOW
+    )
+    assert restarted.should_send is False
+    assert restarted.reason == "already sent"
+
+    class TimeoutPublisher:
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, message):
+            self.calls += 1
+            raise NotificationFailure(retryable=True)
+
+    live_settings = settings.model_copy(update={"dry_run": False})
+    timeout = TimeoutPublisher()
+    second_candidate = one_observation(
+        listing_id="candidate-2",
+        observed_at=NOW + timedelta(minutes=1),
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    second_connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {"event-1": [second_candidate]},
+    )
+
+    second_summary = coordinator(
+        live_settings,
+        database,
+        (second_connector,),
+        alert_service=AlertService(
+            live_settings, database, publisher=timeout
+        ),
+    ).run(NOW + timedelta(minutes=1))
+
+    assert second_summary.sources_succeeded == (Source.STUBHUB,)
+    assert second_summary.sources_failed == ()
+    assert timeout.calls == 1
+    with database() as session:
+        opportunities = session.scalars(
+            select(OpportunityRow).order_by(OpportunityRow.id)
+        ).all()
+        assert len(opportunities) == 2
+        second_opportunity_id = opportunities[-1].id
+        assert len(session.scalars(select(AlertRow)).all()) == 1
+        runs = session.scalars(
+            select(ConnectorRunRow).order_by(ConnectorRunRow.id)
+        ).all()
+        assert len(runs) == 2
+        assert all(run.success is True for run in runs)
+
+    class SuccessPublisher:
+        def publish(self, message):
+            return "provider-retry"
+
+    retry = AlertService(
+        live_settings, database, publisher=SuccessPublisher()
+    ).evaluate_and_send(second_opportunity_id, NOW + timedelta(minutes=1))
+
+    assert retry.should_send is True
+    with database() as session:
+        alerts = session.scalars(select(AlertRow).order_by(AlertRow.id)).all()
+        assert [alert.provider_message_id for alert in alerts] == [
+            "dry-run",
+            "provider-retry",
+        ]
 
 
 def test_build_services_accepts_injected_fakes_without_calling_connectors(settings, database):

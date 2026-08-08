@@ -246,7 +246,8 @@ class ScanCoordinator:
         try:
             repositories = self.repository_factory(session)
             run_id = repositories.runs.start(source, now)
-            counts = self._collect(connector, source, repositories, settings, now)
+            collected = self._collect(connector, source, repositories, settings, now)
+            counts = collected[:4]
             repositories.runs.finish(
                 run_id,
                 success=True,
@@ -254,12 +255,20 @@ class ScanCoordinator:
                 finished_at=_utc(self._clock(), "finished_at"),
             )
             session.commit()
-            return counts
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
+
+        if self.alert_service is not None:
+            for opportunity_id in collected[4]:
+                try:
+                    self.alert_service.evaluate_and_send(opportunity_id, now)
+                except Exception:
+                    # Notification failure cannot change an already committed scan.
+                    continue
+        return counts
 
     def _collect(
         self,
@@ -268,13 +277,14 @@ class ScanCoordinator:
         repositories: RepositoryBundle,
         settings: RuntimeSettings,
         now: datetime,
-    ) -> tuple[int, int, int, int]:
+    ) -> tuple[int, int, int, int, tuple[int, ...]]:
         freshness = timedelta(minutes=settings.observation_freshness_minutes)
         seen_events: set[tuple[Source, str]] = set()
         seen_observations: set[
             tuple[Source, str, ObservationKind, str | None, datetime]
         ] = set()
         events_seen = observations_saved = opportunities_saved = actionable = 0
+        alert_opportunity_ids: list[int] = []
 
         for team in (Team.TEXANS, Team.AGGIES):
             events = connector.discover(team, now, now + DISCOVERY_WINDOW)
@@ -352,10 +362,15 @@ class ScanCoordinator:
                     opportunities_saved += 1
                     if estimate.actionable:
                         actionable += 1
-                        if self.alert_service is not None:
-                            self.alert_service.evaluate_and_send(opportunity_id, now)
+                        alert_opportunity_ids.append(opportunity_id)
 
-        return events_seen, observations_saved, opportunities_saved, actionable
+        return (
+            events_seen,
+            observations_saved,
+            opportunities_saved,
+            actionable,
+            tuple(alert_opportunity_ids),
+        )
 
     def _record_failed_run(
         self, source: Source, started_at: datetime, safe_error: str

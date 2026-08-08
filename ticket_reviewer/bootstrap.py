@@ -15,8 +15,12 @@ from ticket_reviewer.connectors.stubhub import StubHubConnector
 from ticket_reviewer.connectors.ticketmaster import TicketmasterConnector
 from ticket_reviewer.data.db import create_engine_and_session
 from ticket_reviewer.domain.enums import Source
+from ticket_reviewer.services.alerts import (
+    AlertService as OpportunityAlertService,
+    NtfyPublisher,
+)
 from ticket_reviewer.services.scanner import (
-    AlertService,
+    AlertService as ScannerAlertService,
     RepositoryBundle,
     RepositoryFactory,
     ScanCoordinator,
@@ -69,7 +73,7 @@ class ApplicationServices:
     repository_factory: RepositoryFactory
     connectors: tuple[MarketplaceConnector, ...]
     scanner: ScanCoordinator
-    alert_service: AlertService | None
+    alert_service: ScannerAlertService | None
     _owned_connectors: tuple[CloseableConnector, ...] = field(
         default=(), repr=False
     )
@@ -91,7 +95,7 @@ def build_services(
     *,
     session_factory: Callable[[], Session] | None = None,
     repository_factory: RepositoryFactory = RepositoryBundle,
-    alert_service: AlertService | None = None,
+    alert_service: ScannerAlertService | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ApplicationServices:
     """Wire local services and configured official public connectors."""
@@ -99,6 +103,21 @@ def build_services(
         _, session_factory = create_engine_and_session(settings.database_url)
     connector_list = list(connectors)
     connector_sources = _snapshot_connector_sources(connector_list)
+    topic_secret = settings.ntfy_topic
+    configured_topic = (
+        topic_secret.get_secret_value() if topic_secret is not None else ""
+    )
+    token_secret = settings.ntfy_access_token
+    configured_token = (
+        token_secret.get_secret_value() if token_secret is not None else ""
+    )
+    if configured_token and not configured_topic:
+        raise ValueError("invalid notification configuration")
+    token = configured_token or None
+    if configured_topic:
+        NtfyPublisher.validate_configuration(
+            configured_topic, token, settings.ntfy_http_timeout_seconds
+        )
     stubhub_client_id = settings.stubhub_client_id
     configured_stubhub_client_id = (
         stubhub_client_id.get_secret_value().strip()
@@ -114,10 +133,29 @@ def build_services(
     if bool(configured_stubhub_client_id) != bool(configured_stubhub_client_secret):
         raise ValueError("StubHub OAuth credentials must be configured together")
     owned_connectors: list[CloseableConnector] = []
+    effective_alert_service = alert_service
+    if configured_topic and effective_alert_service is None:
+        publisher = NtfyPublisher(
+            configured_topic,
+            token,
+            settings.ntfy_http_timeout_seconds,
+        )
+        owned_connectors.append(publisher)
+        try:
+            effective_alert_service = OpportunityAlertService(
+                settings, session_factory, publisher=publisher
+            )
+        except BaseException as error:
+            _cleanup_without_masking(error, owned_connectors)
+            raise
     key = settings.ticketmaster_api_key
     configured_key = key.get_secret_value().strip() if key is not None else ""
     if configured_key and Source.TICKETMASTER not in connector_sources:
-        client = httpx.Client(timeout=settings.ticketmaster_http_timeout_seconds)
+        try:
+            client = httpx.Client(timeout=settings.ticketmaster_http_timeout_seconds)
+        except BaseException as error:
+            _cleanup_without_masking(error, owned_connectors)
+            raise
         try:
             connector = TicketmasterConnector(
                 settings,
@@ -125,7 +163,7 @@ def build_services(
                 owns_client=True,
             )
         except BaseException as error:
-            _cleanup_without_masking(error, (client,))
+            _cleanup_without_masking(error, (client, *owned_connectors))
             raise
         connector_list.append(connector)
         connector_sources.append(Source.TICKETMASTER)
@@ -182,7 +220,7 @@ def build_services(
             repository_factory,
             connector_tuple,
             connector_sources=tuple(connector_sources),
-            alert_service=alert_service,
+            alert_service=effective_alert_service,
             clock=clock,
         )
     except BaseException as error:
@@ -194,6 +232,6 @@ def build_services(
         repository_factory=repository_factory,
         connectors=connector_tuple,
         scanner=scanner,
-        alert_service=alert_service,
+        alert_service=effective_alert_service,
         _owned_connectors=tuple(owned_connectors),
     )
