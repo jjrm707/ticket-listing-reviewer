@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     database_url: str = "sqlite:///./data/ticket_reviewer.db"
     screenshot_directory: Path = Path("data/screenshots")
     dry_run: bool = True
+    ticketmaster_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
 
     ticketmaster_api_key: SecretStr | None = None
     seatgeek_client_id: SecretStr | None = None

@@ -1,0 +1,81 @@
+{
+  "_embedded": {
+    "events": [
+      {
+        "name": "Houston Texans vs Indianapolis Colts",
+        "type": "event",
+        "id": "texans-colts-home",
+        "url": "https://www.ticketmaster.com/event/texans-colts-home",
+        "dates": {
+          "start": {
+            "localDate": "2026-09-14",
+            "localTime": "19:15:00",
+            "dateTime": "2026-09-15T00:15:00Z"
+          }
+        },
+        "classifications": [
+          {
+            "segment": {"name": "Sports"},
+            "genre": {"name": "Football"},
+            "subGenre": {"name": "NFL"}
+          }
+        ],
+        "priceRanges": [
+          {"type": "standard", "currency": "USD", "min": 82.50, "max": 450.00}
+        ],
+        "_embedded": {
+          "attractions": [
+            {"name": "Houston Texans", "id": "texans"},
+            {"name": "Indianapolis Colts", "id": "colts"}
+          ],
+          "venues": [
+            {
+              "name": "NRG Stadium",
+              "id": "nrg-stadium",
+              "city": {"name": "Houston"},
+              "state": {"stateCode": "TX"},
+              "country": {"countryCode": "US"}
+            }
+          ]
+        }
+      },
+      {
+        "name": "Dallas Cowboys vs Houston Texans",
+        "type": "event",
+        "id": "texans-away",
+        "url": "https://www.ticketmaster.com/event/texans-away",
+        "dates": {"start": {"dateTime": "2026-10-06T00:15:00Z"}},
+        "classifications": [{"segment": {"name": "Sports"}, "genre": {"name": "Football"}}],
+        "_embedded": {
+          "attractions": [{"name": "Dallas Cowboys"}, {"name": "Houston Texans"}],
+          "venues": [{"name": "AT&T Stadium"}]
+        }
+      },
+      {
+        "name": "Houston Texans Parking Pass",
+        "type": "event",
+        "id": "texans-parking",
+        "url": "https://www.ticketmaster.com/event/texans-parking",
+        "dates": {"start": {"dateTime": "2026-09-15T00:15:00Z"}},
+        "classifications": [{"segment": {"name": "Parking"}, "genre": {"name": "Parking"}}],
+        "_embedded": {
+          "attractions": [{"name": "Houston Texans"}],
+          "venues": [{"name": "NRG Stadium Parking Lots"}]
+        }
+      },
+      {
+        "name": "Houston Livestock Show and Rodeo",
+        "type": "event",
+        "id": "unrelated-nrg",
+        "url": "https://www.ticketmaster.com/event/unrelated-nrg",
+        "dates": {"start": {"dateTime": "2026-09-20T00:00:00Z"}},
+        "classifications": [{"segment": {"name": "Miscellaneous"}}],
+        "_embedded": {
+          "attractions": [{"name": "Houston Rodeo"}],
+          "venues": [{"name": "NRG Stadium"}]
+        }
+      }
+    ]
+  },
+  "page": {"size": 100, "totalElements": 4, "totalPages": 1, "number": 0}
+}
