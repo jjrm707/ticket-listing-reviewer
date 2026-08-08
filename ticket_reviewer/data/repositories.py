@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from ticket_reviewer.config import RuntimeSettings, Settings
-from ticket_reviewer.domain.enums import OpportunityStatus, Source
+from ticket_reviewer.domain.enums import OpportunityStatus, Source, Team
 from ticket_reviewer.domain.models import ExternalEvent, OpportunityEstimate, SourceObservation
 
 from .schema import (
@@ -60,7 +60,9 @@ class EventRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
-    def upsert(self, event: ExternalEvent) -> int:
+    def upsert(
+        self, event: ExternalEvent, *, canonical_event_id: int | None = None
+    ) -> int:
         source_value = event.source.value
         source_row = self.session.scalar(
             select(SourceEventRow).where(
@@ -85,14 +87,20 @@ class EventRepository:
             self.session.flush()
             return event_row.id
 
-        event_row = self.session.scalar(
-            select(EventRow).where(
-                EventRow.team == event.team.value,
-                EventRow.opponent == event.opponent,
-                EventRow.venue == event.venue,
-                EventRow.starts_at == event.starts_at,
+        event_row = (
+            self.session.get(EventRow, canonical_event_id)
+            if canonical_event_id is not None
+            else self.session.scalar(
+                select(EventRow).where(
+                    EventRow.team == event.team.value,
+                    EventRow.opponent == event.opponent,
+                    EventRow.venue == event.venue,
+                    EventRow.starts_at == event.starts_at,
+                )
             )
         )
+        if canonical_event_id is not None and event_row is None:
+            raise LookupError(f"canonical event {canonical_event_id} does not exist")
         if event_row is None:
             event_row = EventRow(
                 team=event.team.value,
@@ -130,6 +138,16 @@ class EventRepository:
             )
         )
 
+    def list_for_team(self, team: Team | str) -> list[EventRow]:
+        team_value = Team(team).value
+        return list(
+            self.session.scalars(
+                select(EventRow)
+                .where(EventRow.team == team_value)
+                .order_by(EventRow.starts_at, EventRow.id)
+            )
+        )
+
     @staticmethod
     def _raw_name(event: ExternalEvent) -> str:
         return f"{event.team.value} vs {event.opponent}"
@@ -141,7 +159,9 @@ class ObservationRepository:
 
     def add(self, event_id: int, observation: SourceObservation) -> int:
         listing_identity = (
-            "missing:" if observation.listing_id is None else f"listing:{observation.listing_id}"
+            f"missing:{observation.kind.value}"
+            if observation.listing_id is None
+            else f"listing:{observation.listing_id}"
         )
         existing = self.session.scalar(
             select(ObservationRow).where(
