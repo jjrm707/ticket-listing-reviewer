@@ -8,7 +8,7 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -26,10 +26,24 @@ from ticket_reviewer.services.retry import call_with_retry
 
 _SEARCH_URL = "https://app.ticketmaster.com/discovery/v2/events.json"
 _DETAIL_URL = "https://app.ticketmaster.com/discovery/v2/events/{event_id}.json"
+_MAX_EXTERNAL_ID_BYTES = 256
 _CHICAGO = ZoneInfo("America/Chicago")
 _HOME_NAME = re.compile(r"^\s*Houston\s+Texans\s+vs\.?\s+(.+?)\s*$", re.IGNORECASE)
-_PARKING_WORDS = re.compile(r"\b(parking|tailgate|pass)\b", re.IGNORECASE)
+_PARKING_PRODUCT_TOKENS = frozenset(
+    {
+        "parking",
+        "parkings",
+        "tailgate",
+        "tailgates",
+        "tailgated",
+        "tailgating",
+        "pass",
+        "passes",
+    }
+)
 _VENUE_ALIASES = frozenset({"nrg stadium", "reliant stadium"})
+# Public event links may use only these exact HTTPS hosts.
+_PUBLIC_EVENT_HOSTS = frozenset({"ticketmaster.com", "www.ticketmaster.com"})
 _NFL_OPPONENTS = {
     "Arizona Cardinals": "Cardinals",
     "Atlanta Falcons": "Falcons",
@@ -134,9 +148,9 @@ class TicketmasterConnector:
     def fetch_observations(self, event: ExternalEvent) -> list[SourceObservation]:
         if event.source is not Source.TICKETMASTER:
             raise ValueError("event must come from Ticketmaster")
-        event_id = event.external_id.strip()
-        if not event_id:
-            raise ValueError("event external ID is required")
+        event_id = _validated_external_id(event.external_id)
+        if event_id is None:
+            raise _parse_failure()
 
         url = _DETAIL_URL.format(event_id=quote(event_id, safe=""))
         payload = self._get_json(url, {"apikey": self._api_key})
@@ -157,13 +171,15 @@ class TicketmasterConnector:
             )
         except DecimalException:
             return []
+        if pair_price <= 0:
+            return []
         observed_at = self._clock()
         if observed_at.tzinfo is None or observed_at.utcoffset() is None:
             raise ValueError("clock must return a timezone-aware datetime")
         observed_at = observed_at.astimezone(timezone.utc)
-        public_url = payload.get("url")
-        if not isinstance(public_url, str) or not public_url.strip():
-            public_url = event.url
+        public_url = _public_event_url(payload.get("url"))
+        if public_url is None:
+            public_url = _public_event_url(event.url)
         return [
             SourceObservation(
                 source=Source.TICKETMASTER,
@@ -227,7 +243,7 @@ def _normalize_window(
 
 
 def _utc_parameter(value: datetime) -> str:
-    return value.isoformat(timespec="seconds").replace("+00:00", "Z")
+    return value.isoformat().replace("+00:00", "Z")
 
 
 def _raise_for_status(status_code: int) -> None:
@@ -283,9 +299,9 @@ def _discovery_events(payload: Any) -> list[Any]:
 def _parse_event(raw: Any) -> ExternalEvent | None:
     if not isinstance(raw, dict):
         return None
-    event_id = raw.get("id")
+    event_id = _validated_external_id(raw.get("id"))
     name = raw.get("name")
-    if not isinstance(event_id, str) or not event_id.strip():
+    if event_id is None:
         return None
     if not isinstance(name, str):
         return None
@@ -319,12 +335,10 @@ def _parse_event(raw: Any) -> ExternalEvent | None:
     opponent = _NFL_OPPONENTS.get(opponent_name, opponent_name)
     if not opponent:
         return None
-    public_url = raw.get("url")
-    if not isinstance(public_url, str) or not public_url.strip():
-        public_url = None
+    public_url = _public_event_url(raw.get("url"))
     return ExternalEvent(
         source=Source.TICKETMASTER,
-        external_id=event_id.strip(),
+        external_id=event_id,
         team=Team.TEXANS,
         opponent=opponent,
         venue=venue,
@@ -345,8 +359,43 @@ def _embedded_names(raw: Any) -> list[str]:
     ]
 
 
+def _validated_external_id(raw_id: Any) -> str | None:
+    if not isinstance(raw_id, str):
+        return None
+    event_id = raw_id.strip()
+    if not event_id:
+        return None
+    try:
+        encoded = event_id.encode("utf-8", errors="strict")
+    except UnicodeEncodeError:
+        return None
+    if len(encoded) > _MAX_EXTERNAL_ID_BYTES:
+        return None
+    return event_id
+
+
 def _normalize_text(value: str) -> str:
     return " ".join(re.sub(r"[^a-z0-9]+", " ", value.casefold()).split())
+
+
+def _public_event_url(raw_url: Any) -> str | None:
+    if not isinstance(raw_url, str) or not raw_url.strip():
+        return None
+    try:
+        parsed = urlsplit(raw_url.strip())
+        host = parsed.hostname
+        port = parsed.port
+    except (ValueError, UnicodeError):
+        return None
+    if (
+        parsed.scheme.casefold() != "https"
+        or host not in _PUBLIC_EVENT_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+    ):
+        return None
+    return urlunsplit(("https", host, parsed.path or "/", "", ""))
 
 
 def _has_parking_signal(raw: dict[str, Any]) -> bool:
@@ -366,7 +415,11 @@ def _has_parking_signal(raw: dict[str, Any]) -> bool:
             for value in classification.values():
                 if isinstance(value, dict) and isinstance(value.get("name"), str):
                     signals.append(value["name"])
-    return any(_PARKING_WORDS.search(signal) for signal in signals)
+    return any(
+        token in _PARKING_PRODUCT_TOKENS
+        for signal in signals
+        for token in re.findall(r"[a-z0-9]+", signal.casefold())
+    )
 
 
 def _parse_start(raw_dates: Any) -> datetime | None:

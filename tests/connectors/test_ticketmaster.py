@@ -164,6 +164,36 @@ def test_discovery_reapplies_boundaries_deduplicates_and_sorts(
 
 
 @respx.mock
+def test_discovery_preserves_fractional_utc_parameters_and_end_boundary(
+    connector, fixture_json
+):
+    starts_after = datetime(2026, 9, 1, 0, 0, 0, 123456, tzinfo=timezone.utc)
+    starts_before = datetime(2026, 11, 1, 0, 0, 0, 654321, tzinfo=timezone.utc)
+    home = fixture_json["_embedded"]["events"][0]
+    just_before = copy.deepcopy(home)
+    just_before["id"] = "just-before-fractional-end"
+    just_before["dates"]["start"]["dateTime"] = "2026-11-01T00:00:00.654320Z"
+    at_end = copy.deepcopy(home)
+    at_end["id"] = "at-fractional-end"
+    at_end["dates"]["start"]["dateTime"] = "2026-11-01T00:00:00.654321Z"
+    route = respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(
+            200, json={"_embedded": {"events": [at_end, just_before]}}
+        )
+    )
+
+    events = connector.discover(Team.TEXANS, starts_after, starts_before)
+
+    assert dict(route.calls[0].request.url.params)["startDateTime"] == (
+        "2026-09-01T00:00:00.123456Z"
+    )
+    assert dict(route.calls[0].request.url.params)["endDateTime"] == (
+        "2026-11-01T00:00:00.654321Z"
+    )
+    assert [event.external_id for event in events] == ["just-before-fractional-end"]
+
+
+@respx.mock
 def test_discovery_uses_chicago_local_date_fallback(connector, fixture_json):
     home = fixture_json["_embedded"]["events"][0]
     local_only = copy.deepcopy(home)
@@ -216,6 +246,35 @@ def test_discovery_filters_required_home_event_signals(
     ] == expected_ids
 
 
+@pytest.mark.parametrize(
+    ("location", "signal", "accepted"),
+    [
+        ("name", "Houston Texans vs Indianapolis Colts Tailgating", False),
+        ("name", "Houston Texans vs Indianapolis Colts Passes", False),
+        ("classification", "Tailgating", False),
+        ("classification", "Passes", False),
+        ("classification", "Passenger Experience", True),
+        ("classification", "Compassion Sports", True),
+    ],
+)
+@respx.mock
+def test_parking_product_inflections_are_token_aware(
+    connector, fixture_json, location, signal, accepted
+):
+    event = copy.deepcopy(fixture_json["_embedded"]["events"][0])
+    if location == "name":
+        event["name"] = signal
+    else:
+        event["classifications"][0]["subGenre"] = {"name": signal}
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"_embedded": {"events": [event]}})
+    )
+
+    events = connector.discover(Team.TEXANS, WINDOW_START, WINDOW_END)
+
+    assert bool(events) is accepted
+
+
 @respx.mock
 def test_opponent_falls_back_to_supported_home_name_and_accepts_reliant_alias(
     connector, fixture_json
@@ -233,6 +292,72 @@ def test_opponent_falls_back_to_supported_home_name_and_accepts_reliant_alias(
     assert [(event.opponent, event.venue) for event in events] == [
         ("Colts", "Reliant Stadium")
     ]
+
+
+@pytest.mark.parametrize(
+    ("raw_url", "expected_url"),
+    [
+        (
+            "https://www.ticketmaster.com/event/public?apikey=url-secret#private",
+            "https://www.ticketmaster.com/event/public",
+        ),
+        (
+            "https://ticketmaster.com/event/public?tracking=private#fragment",
+            "https://ticketmaster.com/event/public",
+        ),
+        ("http://www.ticketmaster.com/event/public", None),
+        ("https://evil.example/event/public", None),
+        ("https://ticketmaster.com.evil.example/event/public", None),
+        ("https://attacker@www.ticketmaster.com/event/public", None),
+    ],
+)
+@respx.mock
+def test_discovery_exposes_only_allowlisted_sanitized_public_urls(
+    connector, fixture_json, raw_url, expected_url
+):
+    event = copy.deepcopy(fixture_json["_embedded"]["events"][0])
+    event["url"] = raw_url
+    respx.get(SEARCH_URL).mock(
+        return_value=httpx.Response(200, json={"_embedded": {"events": [event]}})
+    )
+
+    discovered = connector.discover(Team.TEXANS, WINDOW_START, WINDOW_END)
+
+    assert discovered[0].url == expected_url
+    assert "url-secret" not in repr(discovered[0])
+    assert "tracking=private" not in repr(discovered[0])
+
+
+@respx.mock
+def test_detail_and_fallback_urls_use_the_same_public_url_boundary(
+    connector, tm_event
+):
+    event = ExternalEvent(
+        source=tm_event.source,
+        external_id=tm_event.external_id,
+        team=tm_event.team,
+        opponent=tm_event.opponent,
+        venue=tm_event.venue,
+        starts_at=tm_event.starts_at,
+        is_home=tm_event.is_home,
+        is_parking=tm_event.is_parking,
+        url="https://ticketmaster.com/event/fallback?token=fallback-secret#private",
+    )
+    respx.get(DETAIL_URL).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "url": "https://evil.example/event/detail?token=detail-secret",
+                "priceRanges": [{"currency": "USD", "min": 50}],
+            },
+        )
+    )
+
+    observation = connector.fetch_observations(event)[0]
+
+    assert observation.listing_url == "https://ticketmaster.com/event/fallback"
+    assert "fallback-secret" not in repr(observation)
+    assert "detail-secret" not in repr(observation)
 
 
 @respx.mock
@@ -292,6 +417,7 @@ def test_price_parser_chooses_lowest_valid_usd_minimum(connector, tm_event):
         None,
         [],
         [{"currency": "EUR", "min": 1}],
+        [{"currency": "USD", "min": "0.001"}],
         [{"currency": "USD", "min": "1E+999999"}],
     ],
 )
@@ -307,7 +433,7 @@ def test_missing_or_unusable_price_ranges_return_no_observation(
     assert connector.fetch_observations(tm_event) == []
 
 
-def test_fetch_observations_rejects_wrong_source_or_missing_id(connector, tm_event):
+def test_fetch_observations_rejects_wrong_source(connector, tm_event):
     wrong_source = ExternalEvent(
         source=Source.STUBHUB,
         external_id=tm_event.external_id,
@@ -319,9 +445,21 @@ def test_fetch_observations_rejects_wrong_source_or_missing_id(connector, tm_eve
         is_parking=False,
         url=tm_event.url,
     )
-    missing_id = ExternalEvent(
+    with pytest.raises(ValueError, match="Ticketmaster"):
+        connector.fetch_observations(wrong_source)
+
+
+@pytest.mark.parametrize(
+    "external_id",
+    [None, 123, "", "   ", "attacker-secret-" + ("x" * 257), "\ud800attacker-secret"],
+)
+@respx.mock
+def test_invalid_external_ids_fail_generically_without_network_or_leakage(
+    connector, tm_event, external_id
+):
+    event = ExternalEvent(
         source=Source.TICKETMASTER,
-        external_id=" ",
+        external_id=external_id,
         team=tm_event.team,
         opponent=tm_event.opponent,
         venue=tm_event.venue,
@@ -331,10 +469,48 @@ def test_fetch_observations_rejects_wrong_source_or_missing_id(connector, tm_eve
         url=tm_event.url,
     )
 
-    with pytest.raises(ValueError, match="Ticketmaster"):
-        connector.fetch_observations(wrong_source)
-    with pytest.raises(ValueError, match="external ID"):
-        connector.fetch_observations(missing_id)
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.fetch_observations(event)
+
+    assert caught.value.category is FailureCategory.PARSE
+    assert caught.value.retryable is False
+    exposed = f"{caught.value!s} {caught.value!r} {caught.value.args!r}"
+    assert "attacker-secret" not in exposed
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_external_id_is_bounded_then_safely_encoded_as_one_path_segment(
+    connector, tm_event
+):
+    external_id = "abc/def ?é"
+    event = ExternalEvent(
+        source=Source.TICKETMASTER,
+        external_id=external_id,
+        team=tm_event.team,
+        opponent=tm_event.opponent,
+        venue=tm_event.venue,
+        starts_at=tm_event.starts_at,
+        is_home=True,
+        is_parking=False,
+        url=tm_event.url,
+    )
+    route = respx.get(
+        "https://app.ticketmaster.com/discovery/v2/events/abc%2Fdef%20%3F%C3%A9.json"
+    ).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "url": tm_event.url,
+                "priceRanges": [{"currency": "USD", "min": 50}],
+            },
+        )
+    )
+
+    observation = connector.fetch_observations(event)[0]
+
+    assert route.call_count == 1
+    assert observation.event_external_id == external_id
 
 
 @pytest.mark.parametrize(
