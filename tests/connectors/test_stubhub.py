@@ -135,6 +135,86 @@ def test_oauth_uses_exact_basic_form_and_scope(token_provider, token_json):
 
 
 @respx.mock
+def test_oauth_preserves_exact_nonblank_unicode_credentials(client, token_json):
+    exact_id = "  clïent-id  "
+    exact_secret = " sëcret value "
+    provider = StubHubTokenProvider(
+        Settings(
+            _env_file=None,
+            stubhub_client_id=exact_id,
+            stubhub_client_secret=exact_secret,
+        ),
+        client,
+        sleep=lambda _delay: None,
+    )
+    route = respx.post(TOKEN_URL).mock(
+        return_value=httpx.Response(200, json=token_json)
+    )
+
+    assert provider.get_token(NOW) == "access-token"
+
+    expected = base64.b64encode(f"{exact_id}:{exact_secret}".encode("utf-8")).decode()
+    assert route.calls[0].request.headers["authorization"] == f"Basic {expected}"
+
+
+@pytest.mark.parametrize(
+    ("client_id", "client_secret"),
+    [
+        ("   ", CLIENT_SECRET),
+        (CLIENT_ID, "\t"),
+        ("bad\x00id", CLIENT_SECRET),
+        (CLIENT_ID, "bad\nsecret"),
+        ("bad\ud800id", CLIENT_SECRET),
+        ("x" * 1025, CLIENT_SECRET),
+        (CLIENT_ID, "x" * 1025),
+    ],
+)
+@respx.mock
+def test_oauth_rejects_blank_unsafe_or_oversized_credentials_before_request(
+    client, client_id, client_secret
+):
+    with pytest.raises(ValueError) as caught:
+        StubHubTokenProvider(
+            Settings(
+                _env_file=None,
+                stubhub_client_id=client_id,
+                stubhub_client_secret=client_secret,
+            ),
+            client,
+            sleep=lambda _delay: None,
+        )
+    exposed = f"{caught.value!s} {caught.value!r} {caught.value.args!r}"
+    for credential in (client_id, client_secret):
+        if credential.strip():
+            assert credential not in exposed
+    assert respx.calls.call_count == 0
+
+
+def test_oauth_maps_basic_auth_construction_exception_to_safe_auth(
+    client, token_json, monkeypatch
+):
+    provider = StubHubTokenProvider(settings(), client, sleep=lambda _delay: None)
+
+    def fail_basic_auth(*_args, **_kwargs):
+        raise RuntimeError(f"construction failed {CLIENT_SECRET}")
+
+    monkeypatch.setattr(
+        "ticket_reviewer.connectors.stubhub.httpx.BasicAuth", fail_basic_auth
+    )
+
+    with pytest.raises(ConnectorFailure) as caught:
+        provider.get_token(NOW)
+
+    assert (caught.value.category, caught.value.retryable) == (
+        FailureCategory.AUTH,
+        False,
+    )
+    exposed = f"{caught.value!s} {caught.value!r} {caught.value.args!r}"
+    assert CLIENT_ID not in exposed
+    assert CLIENT_SECRET not in exposed
+
+
+@respx.mock
 def test_reuses_token_until_safety_window(token_provider, token_json):
     route = respx.post(TOKEN_URL).mock(return_value=httpx.Response(200, json=token_json))
     first = token_provider.get_token(NOW)
@@ -187,6 +267,58 @@ def test_token_cache_is_concurrency_safe(client, token_json):
     assert calls == 1
 
 
+@pytest.mark.parametrize(
+    ("status", "category", "posts_per_generation"),
+    [
+        (403, FailureCategory.AUTH, 1),
+        (500, FailureCategory.NETWORK, 3),
+    ],
+)
+@respx.mock
+def test_concurrent_failed_refresh_is_single_flight_per_generation(
+    client, status, category, posts_per_generation
+):
+    first_post = threading.Event()
+    post_count = 0
+    post_lock = threading.Lock()
+
+    def response(_request):
+        nonlocal post_count
+        with post_lock:
+            post_count += 1
+            current = post_count
+        if current == 1:
+            first_post.set()
+            time.sleep(0.1)
+        return httpx.Response(status, text="private credential response")
+
+    route = respx.post(TOKEN_URL).mock(side_effect=response)
+    provider = StubHubTokenProvider(settings(), client, sleep=lambda _delay: None)
+    callers_ready = threading.Barrier(8)
+
+    def invoke():
+        callers_ready.wait()
+        try:
+            provider.get_token(NOW)
+        except ConnectorFailure as error:
+            return error
+        raise AssertionError("failed token acquisition unexpectedly succeeded")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        errors = list(pool.map(lambda _index: invoke(), range(8)))
+
+    assert first_post.is_set()
+    assert route.call_count == posts_per_generation
+    assert all(error.category is category for error in errors)
+    assert all(error.retryable is (category is FailureCategory.NETWORK) for error in errors)
+    assert all("private" not in f"{error!s} {error!r}" for error in errors)
+
+    with pytest.raises(ConnectorFailure) as later:
+        provider.get_token(NOW + timedelta(seconds=1))
+    assert later.value.category is category
+    assert route.call_count == posts_per_generation * 2
+
+
 @respx.mock
 def test_invalidation_can_target_only_rejected_cached_token(token_provider, token_json):
     second = copy.deepcopy(token_json)
@@ -215,6 +347,9 @@ def test_invalidation_can_target_only_rejected_cached_token(token_provider, toke
         ("expires_in", True),
         ("expires_in", 0),
         ("expires_in", "3600"),
+        ("expires_in", 1.5),
+        ("expires_in", 31_536_001),
+        ("expires_in", 10**100),
         ("scope", "read:inventory"),
         ("scope", ["read:events"]),
     ],
@@ -414,6 +549,17 @@ def test_search_requires_explicit_hal_events_list(connector, token_json, payload
         ("https://stubhub.com.evil.example/event/1", None),
         ("https://user@stubhub.com/event/1", None),
         ("https://stubhub.com:444/event/1", None),
+        ("https://stubhub.com/event/\x00hidden", None),
+        ("https://stubhub.com/event/line\nbreak", None),
+        ("https://stubhub.com/event/%00hidden", None),
+        ("https://stubhub.com/event/%0Abreak", None),
+        ("https://stubhub.com/event/%7Fdelete", None),
+        ("https://stubhub.com/event/%GG", None),
+        ("https://stubhub.com/event/%", None),
+        (
+            "https://stubhub.com/event/valid%20seat?tracking=%00#fragment%0A",
+            "https://stubhub.com/event/valid%20seat",
+        ),
     ],
 )
 @respx.mock
@@ -581,10 +727,43 @@ def test_detail_accepts_merged_replacement_but_preserves_requested_identity(
 ):
     payload = detail(search_json)
     payload["id"] = 120099
+    payload["name"] = "Baltimore Ravens Football at Houston Texans"
+    payload["categories"][1]["name"] = "Baltimore Ravens Football"
+    payload["start_date"] = "2026-09-20T12:04:00-05:00"
     authorize(token_json)
     respx.get(DETAIL_URL).mock(return_value=httpx.Response(200, json=payload))
     observation = connector.fetch_observations(stubhub_event)[0]
     assert observation.event_external_id == "120001"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["different_opponent", "kickoff_outside_tolerance", "different_date"],
+)
+@respx.mock
+def test_detail_rejects_replacement_for_another_game(
+    connector, token_json, search_json, stubhub_event, mutation
+):
+    payload = detail(search_json)
+    payload["id"] = 120099
+    if mutation == "different_opponent":
+        payload["name"] = "Buffalo Bills at Houston Texans"
+        payload["categories"][1]["name"] = "Buffalo Bills"
+    elif mutation == "kickoff_outside_tolerance":
+        payload["start_date"] = "2026-09-20T12:06:00-05:00"
+    else:
+        payload["start_date"] = "2026-09-27T12:00:00-05:00"
+    authorize(token_json)
+    respx.get(DETAIL_URL).mock(return_value=httpx.Response(200, json=payload))
+
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.fetch_observations(stubhub_event)
+
+    assert (caught.value.category, caught.value.retryable) == (
+        FailureCategory.PARSE,
+        False,
+    )
+    assert "120099" not in f"{caught.value!s} {caught.value!r}"
 
 
 @respx.mock

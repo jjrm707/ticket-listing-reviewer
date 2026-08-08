@@ -9,7 +9,7 @@ from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -28,6 +28,9 @@ _CHICAGO = ZoneInfo("America/Chicago")
 _MAX_EVENT_ID = 2_147_483_647
 _MAX_EVENT_ID_DIGITS = 10
 _MAX_TOKEN_BYTES = 4096
+_MAX_CREDENTIAL_BYTES = 1024
+_MAX_TOKEN_LIFETIME_SECONDS = 31_536_000
+_DETAIL_START_TOLERANCE = timedelta(minutes=5)
 _PUBLIC_EVENT_HOSTS = frozenset({"stubhub.com", "www.stubhub.com"})
 _PRODUCT_WORDS = frozenset(
     {
@@ -95,36 +98,81 @@ class StubHubTokenProvider:
         *,
         sleep: Callable[[float], object] = time.sleep,
     ) -> None:
-        client_id = _secret_value(settings.stubhub_client_id)
-        client_secret = _secret_value(settings.stubhub_client_secret)
-        if not client_id or not client_secret:
-            raise ValueError("StubHub OAuth credentials are required")
+        client_id = _credential_value(settings.stubhub_client_id)
+        client_secret = _credential_value(settings.stubhub_client_secret)
         self._client_id = client_id
         self._client_secret = client_secret
         self._client = client
         self._sleep = sleep
-        self._lock = threading.Lock()
+        self._condition = threading.Condition()
         self._token: str | None = None
         self._reuse_before: datetime | None = None
+        self._refreshing = False
+        self._generation = 0
+        self._generation_waiters: dict[int, int] = {}
+        self._generation_results: dict[
+            int, tuple[str | None, BaseException | None]
+        ] = {}
 
     def get_token(self, now: datetime) -> str:
         """Return a cached bearer token or acquire one using client credentials."""
         normalized_now = _aware_utc(now, "now must be timezone-aware")
-        with self._lock:
+        with self._condition:
             if (
                 self._token is not None
                 and self._reuse_before is not None
                 and normalized_now < self._reuse_before
             ):
                 return self._token
+            if self._refreshing:
+                generation = self._generation
+                self._generation_waiters[generation] = (
+                    self._generation_waiters.get(generation, 0) + 1
+                )
+                try:
+                    while (
+                        self._refreshing and self._generation == generation
+                    ):
+                        self._condition.wait()
+                    token, failure = self._generation_results[generation]
+                finally:
+                    remaining = self._generation_waiters[generation] - 1
+                    if remaining:
+                        self._generation_waiters[generation] = remaining
+                    else:
+                        self._generation_waiters.pop(generation, None)
+                        self._generation_results.pop(generation, None)
+                if failure is not None:
+                    raise failure
+                if token is None:
+                    raise AssertionError("token refresh completed without a result")
+                return token
+            self._generation += 1
+            generation = self._generation
+            self._refreshing = True
+
+        try:
             token, expires_in = call_with_retry(self._acquire_token, self._sleep)
+        except BaseException as error:
+            with self._condition:
+                if self._generation_waiters.get(generation, 0):
+                    self._generation_results[generation] = (None, error)
+                self._refreshing = False
+                self._condition.notify_all()
+            raise
+
+        with self._condition:
             self._token = token
             self._reuse_before = normalized_now + timedelta(seconds=expires_in - 60)
+            if self._generation_waiters.get(generation, 0):
+                self._generation_results[generation] = (token, None)
+            self._refreshing = False
+            self._condition.notify_all()
             return token
 
     def invalidate(self, token: str | None = None) -> None:
         """Invalidate all cached state, or only state matching a rejected token."""
-        with self._lock:
+        with self._condition:
             if token is not None and token != self._token:
                 return
             self._token = None
@@ -132,10 +180,14 @@ class StubHubTokenProvider:
 
     def _acquire_token(self) -> tuple[str, int]:
         try:
+            auth = httpx.BasicAuth(self._client_id, self._client_secret)
+        except Exception:
+            raise _auth_failure() from None
+        try:
             response = self._client.post(
                 _TOKEN_URL,
                 data={"grant_type": "client_credentials", "scope": "read:events"},
-                auth=httpx.BasicAuth(self._client_id, self._client_secret),
+                auth=auth,
             )
         except httpx.RequestError:
             raise _network_failure() from None
@@ -222,7 +274,12 @@ class StubHubConnector:
             raise _parse_failure()
         payload = self._catalog_json(_DETAIL_URL.format(event_id=event_id), {})
         returned = _parse_event(payload, event.team)
-        if returned is None:
+        if (
+            returned is None
+            or _opponent_identity(returned.opponent)
+            != _opponent_identity(event.opponent)
+            or abs(returned.starts_at - event.starts_at) > _DETAIL_START_TOLERANCE
+        ):
             raise _parse_failure()
 
         if "min_ticket_price" not in payload:
@@ -298,10 +355,22 @@ class StubHubConnector:
         return call_with_retry(request, self._sleep)
 
 
-def _secret_value(secret: Any) -> str:
+def _credential_value(secret: Any) -> str:
     if secret is None:
-        return ""
-    return secret.get_secret_value().strip()
+        raise ValueError("StubHub OAuth credentials are required")
+    value = secret.get_secret_value()
+    if not value or not value.strip():
+        raise ValueError("StubHub OAuth credentials are required")
+    try:
+        encoded = value.encode("utf-8", errors="strict")
+    except (UnicodeError, ValueError, OverflowError):
+        raise ValueError("StubHub OAuth credentials are invalid") from None
+    if len(encoded) > _MAX_CREDENTIAL_BYTES or any(
+        ord(character) < 32 or 127 <= ord(character) <= 159
+        for character in value
+    ):
+        raise ValueError("StubHub OAuth credentials are invalid")
+    return value
 
 
 def _aware_utc(value: datetime, message: str) -> datetime:
@@ -328,7 +397,11 @@ def _parse_token_payload(payload: Any) -> tuple[str, int]:
     if not isinstance(token_type, str) or token_type.casefold() != "bearer":
         raise _parse_failure()
     expires_in = payload.get("expires_in")
-    if type(expires_in) is not int or expires_in <= 0:
+    if (
+        type(expires_in) is not int
+        or expires_in <= 0
+        or expires_in > _MAX_TOKEN_LIFETIME_SECONDS
+    ):
         raise _parse_failure()
     scope = payload.get("scope")
     if scope is not None:
@@ -510,7 +583,11 @@ def _public_event_url_from_links(raw_links: Any) -> str | None:
 
 
 def _public_event_url(raw_url: Any) -> str | None:
-    if not isinstance(raw_url, str) or not raw_url.strip():
+    if (
+        not isinstance(raw_url, str)
+        or not raw_url.strip()
+        or _has_unsafe_url_text(raw_url)
+    ):
         return None
     try:
         parsed = urlsplit(raw_url.strip())
@@ -526,7 +603,26 @@ def _public_event_url(raw_url: Any) -> str | None:
         or port is not None
     ):
         return None
+    if re.search(r"%(?![0-9a-fA-F]{2})", parsed.path):
+        return None
+    try:
+        decoded_path = unquote(parsed.path, encoding="utf-8", errors="strict")
+    except (UnicodeError, ValueError):
+        return None
+    if _has_unsafe_url_text(decoded_path):
+        return None
     return urlunsplit(("https", host, parsed.path or "/", "", ""))
+
+
+def _has_unsafe_url_text(value: str) -> bool:
+    try:
+        value.encode("utf-8", errors="strict")
+    except UnicodeError:
+        return True
+    return any(
+        ord(character) < 32 or 127 <= ord(character) <= 159
+        for character in value
+    )
 
 
 def _minimum_price(raw: Any) -> Decimal:
