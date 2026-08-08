@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from ticket_reviewer.config import Settings
 from ticket_reviewer.connectors.base import MarketplaceConnector
 from ticket_reviewer.connectors.seatgeek import SeatGeekConnector
+from ticket_reviewer.connectors.stubhub import StubHubConnector
 from ticket_reviewer.connectors.ticketmaster import TicketmasterConnector
 from ticket_reviewer.data.db import create_engine_and_session
 from ticket_reviewer.domain.enums import Source
@@ -98,6 +99,20 @@ def build_services(
         _, session_factory = create_engine_and_session(settings.database_url)
     connector_list = list(connectors)
     connector_sources = _snapshot_connector_sources(connector_list)
+    stubhub_client_id = settings.stubhub_client_id
+    configured_stubhub_client_id = (
+        stubhub_client_id.get_secret_value().strip()
+        if stubhub_client_id is not None
+        else ""
+    )
+    stubhub_client_secret = settings.stubhub_client_secret
+    configured_stubhub_client_secret = (
+        stubhub_client_secret.get_secret_value().strip()
+        if stubhub_client_secret is not None
+        else ""
+    )
+    if bool(configured_stubhub_client_id) != bool(configured_stubhub_client_secret):
+        raise ValueError("StubHub OAuth credentials must be configured together")
     owned_connectors: list[CloseableConnector] = []
     key = settings.ticketmaster_api_key
     configured_key = key.get_secret_value().strip() if key is not None else ""
@@ -136,6 +151,28 @@ def build_services(
             raise
         connector_list.append(connector)
         connector_sources.append(Source.SEATGEEK)
+        owned_connectors.append(connector)
+    if (
+        configured_stubhub_client_id
+        and configured_stubhub_client_secret
+        and Source.STUBHUB not in connector_sources
+    ):
+        try:
+            client = httpx.Client(timeout=settings.stubhub_http_timeout_seconds)
+        except BaseException as error:
+            _cleanup_without_masking(error, owned_connectors)
+            raise
+        try:
+            connector = StubHubConnector(
+                settings,
+                client,
+                owns_client=True,
+            )
+        except BaseException as error:
+            _cleanup_without_masking(error, (client, *owned_connectors))
+            raise
+        connector_list.append(connector)
+        connector_sources.append(Source.STUBHUB)
         owned_connectors.append(connector)
     connector_tuple = tuple(connector_list)
     try:

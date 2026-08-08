@@ -33,11 +33,13 @@ class Settings(BaseSettings):
     dry_run: bool = True
     ticketmaster_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
     seatgeek_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
+    stubhub_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
 
     ticketmaster_api_key: SecretStr | None = None
     seatgeek_client_id: SecretStr | None = None
     seatgeek_client_secret: SecretStr | None = None
-    stubhub_api_key: SecretStr | None = None
+    stubhub_client_id: SecretStr | None = None
+    stubhub_client_secret: SecretStr | None = None
     ntfy_topic: SecretStr | None = None
     ntfy_access_token: SecretStr | None = None
 

@@ -1,0 +1,73 @@
+{
+  "_embedded": {
+    "events": [
+      {
+        "id": 120001,
+        "name": "Baltimore Ravens at Houston Texans",
+        "status": "Active",
+        "type": "Event",
+        "start_date": "2026-09-20T12:00:00-05:00",
+        "venue": {"name": "NRG Stadium"},
+        "categories": [
+          {"name": "Houston Texans"},
+          {"name": "Baltimore Ravens"}
+        ],
+        "_links": {
+          "self": {"href": "https://api.stubhub.net/catalog/events/120001"},
+          "event:webpage": {
+            "href": "https://www.stubhub.com/houston-texans-tickets/event/120001?tracking=sanitized#details"
+          }
+        },
+        "min_ticket_price": {"amount": "123.455", "currency_code": "USD"}
+      },
+      {
+        "id": 120002,
+        "name": "LSU Tigers at Texas A&M Aggies Football",
+        "status": "Active",
+        "type": "Event",
+        "start_date": "2026-10-17T18:30:00-05:00",
+        "venue": {"name": "Kyle Field"},
+        "categories": [
+          {"name": "Texas A&M Aggies Football"},
+          {"name": "LSU Tigers"}
+        ],
+        "_links": {
+          "event:webpage": {
+            "href": "https://stubhub.com/texas-am-aggies-tickets/event/120002"
+          }
+        },
+        "min_ticket_price": {"amount": "80.00", "currency_code": "USD"}
+      },
+      {
+        "id": 120003,
+        "name": "Houston Texans at Dallas Cowboys",
+        "status": "Active",
+        "type": "Event",
+        "start_date": "2026-09-27T12:00:00-05:00",
+        "venue": {"name": "AT&T Stadium"},
+        "categories": [{"name": "Houston Texans"}, {"name": "Dallas Cowboys"}],
+        "_links": {"event:webpage": {"href": "https://stubhub.com/event/120003"}}
+      },
+      {
+        "id": 120004,
+        "name": "Baltimore Ravens at Houston Texans Parking Pass",
+        "status": "Active",
+        "type": "Parking",
+        "start_date": "2026-09-20T11:00:00-05:00",
+        "venue": {"name": "NRG Stadium"},
+        "categories": [{"name": "Houston Texans"}],
+        "_links": {"event:webpage": {"href": "https://stubhub.com/event/120004"}}
+      },
+      {
+        "id": 120005,
+        "name": "Indianapolis Colts at Houston Texans",
+        "status": "Cancelled",
+        "type": "Event",
+        "start_date": "2026-10-04T12:00:00-05:00",
+        "venue": {"name": "NRG Stadium"},
+        "categories": [{"name": "Houston Texans"}, {"name": "Indianapolis Colts"}],
+        "_links": {"event:webpage": {"href": "https://stubhub.com/event/120005"}}
+      }
+    ]
+  }
+}
