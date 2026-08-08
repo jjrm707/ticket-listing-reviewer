@@ -1,5 +1,6 @@
 """Small transaction-scoped repositories for persistence consumers."""
 
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import re
@@ -153,11 +154,22 @@ class EventRepository:
         return f"{event.team.value} vs {event.opponent}"
 
 
+@dataclass(frozen=True, slots=True)
+class ObservationAddResult:
+    observation_id: int
+    inserted: bool
+
+
 class ObservationRepository:
     def __init__(self, session: Session) -> None:
         self.session = session
 
     def add(self, event_id: int, observation: SourceObservation) -> int:
+        return self.add_with_status(event_id, observation).observation_id
+
+    def add_with_status(
+        self, event_id: int, observation: SourceObservation
+    ) -> ObservationAddResult:
         listing_identity = (
             f"missing:{observation.kind.value}"
             if observation.listing_id is None
@@ -172,7 +184,7 @@ class ObservationRepository:
             )
         )
         if existing is not None:
-            return existing.id
+            return ObservationAddResult(existing.id, inserted=False)
 
         row = ObservationRow(
             event_id=event_id,
@@ -197,7 +209,7 @@ class ObservationRepository:
         )
         self.session.add(row)
         self.session.flush()
-        return row.id
+        return ObservationAddResult(row.id, inserted=True)
 
     def get(self, observation_id: int) -> ObservationRow | None:
         return self.session.get(ObservationRow, observation_id)

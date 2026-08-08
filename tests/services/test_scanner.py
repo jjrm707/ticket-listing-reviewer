@@ -262,6 +262,70 @@ def test_connector_transaction_rolls_back_then_failed_run_commits_safely(setting
         assert runs[0].redacted_error == "marketplace temporarily unavailable"
 
 
+def test_failed_run_commit_error_does_not_abort_later_connectors_or_leak(
+    settings, database
+):
+    secret = "failed-run commit body Bearer persistence-secret"
+
+    class CommitFailingSession:
+        def __init__(self, session):
+            self._session = session
+
+        def __getattr__(self, name):
+            return getattr(self._session, name)
+
+        def commit(self):
+            raise RuntimeError(secret)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            self.close()
+
+    class ThirdSessionCommitFails:
+        def __init__(self, factory):
+            self.factory = factory
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            session = self.factory()
+            if self.calls == 3:
+                return CommitFailingSession(session)
+            return session
+
+    failing_factory = ThirdSessionCommitFails(database)
+    bad = FakeConnector(
+        Source.TICKETMASTER,
+        {Team.TEXANS: failure(Source.TICKETMASTER)},
+        {},
+    )
+    event = one_event()
+    good = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {event.external_id: [one_observation()]},
+    )
+    scanner = ScanCoordinator(
+        settings,
+        failing_factory,
+        RepositoryBundle,
+        (bad, good),
+        clock=lambda: FINISHED,
+    )
+
+    summary = scanner.run(NOW)
+
+    assert summary.sources_failed == (Source.TICKETMASTER,)
+    assert summary.sources_succeeded == (Source.STUBHUB,)
+    assert summary.observations_saved == 1
+    with database() as session:
+        runs = session.scalars(select(ConnectorRunRow)).all()
+        assert [(row.source, row.success) for row in runs] == [("stubhub", True)]
+        assert all(secret not in (row.redacted_error or "") for row in runs)
+
+
 def test_failed_connector_preserves_previous_successful_snapshot(settings, database):
     event = one_event()
     old = one_observation(observed_at=NOW - timedelta(minutes=10))
@@ -277,6 +341,64 @@ def test_failed_connector_preserves_previous_successful_snapshot(settings, datab
         rows = session.scalars(select(ObservationRow)).all()
         assert len(rows) == 1
         assert rows[0].observed_at == old.observed_at
+
+
+def test_identical_snapshot_replay_is_not_counted_or_scored_again(settings, database):
+    event = one_event()
+    observation = one_observation(
+        listing_id="replayed",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {event.external_id: [observation]},
+    )
+    scanner = coordinator(settings, database, (connector,))
+
+    first = scanner.run(NOW)
+    second = scanner.run(NOW)
+
+    assert (first.observations_saved, first.opportunities_saved) == (1, 1)
+    assert (second.observations_saved, second.opportunities_saved) == (0, 0)
+    with database() as session:
+        assert len(session.scalars(select(ObservationRow)).all()) == 1
+        assert len(session.scalars(select(OpportunityRow)).all()) == 1
+
+
+def test_conflicting_snapshot_replay_uses_stored_row_and_creates_no_estimate(
+    settings, database
+):
+    event = one_event()
+    stored = one_observation(
+        listing_id="same-identity",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    with database() as session:
+        event_id = EventRepository(session).upsert(event)
+        ObservationRepository(session).add(event_id, stored)
+        session.commit()
+    conflicting = replace(stored, pair_price=Decimal("350"))
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {event.external_id: [conflicting]},
+    )
+
+    summary = coordinator(settings, database, (connector,)).run(NOW)
+
+    assert summary.observations_saved == 0
+    assert summary.opportunities_saved == 0
+    with database() as session:
+        observations = session.scalars(select(ObservationRow)).all()
+        opportunities = session.scalars(select(OpportunityRow)).all()
+        assert len(observations) == 1
+        assert observations[0].pair_price == Decimal("100.00")
+        assert opportunities == []
 
 
 def test_unexpected_connector_error_isolated_without_raw_details(settings, database):

@@ -198,8 +198,11 @@ class ScanCoordinator:
                     if isinstance(error, ConnectorFailure)
                     else _UNEXPECTED_ERROR
                 )
-                self._record_failed_run(connector.source, started_at, safe_error)
                 failed.append(connector.source)
+                try:
+                    self._record_failed_run(connector.source, started_at, safe_error)
+                except Exception:
+                    pass
                 continue
             succeeded.append(connector.source)
             events_seen += result[0]
@@ -278,7 +281,7 @@ class ScanCoordinator:
 
                 event_id = _upsert_matched_event(repositories, event)
                 observations = connector.fetch_observations(event)
-                candidates: list[SourceObservation] = []
+                candidates: list[tuple[int, SourceObservation]] = []
                 for observation in observations:
                     if not isinstance(observation, SourceObservation):
                         raise TypeError("connector returned an invalid observation")
@@ -297,15 +300,27 @@ class ScanCoordinator:
                     if key in seen_observations:
                         continue
                     seen_observations.add(key)
-                    repositories.observations.add(event_id, observation)
+                    saved = repositories.observations.add_with_status(
+                        event_id, observation
+                    )
+                    if not saved.inserted:
+                        continue
+                    persisted_row = repositories.observations.get(
+                        saved.observation_id
+                    )
+                    if persisted_row is None:
+                        raise RuntimeError("persisted observation is unavailable")
+                    persisted = _observation_from_row(
+                        persisted_row, observation.event_external_id
+                    )
                     observations_saved += 1
-                    if _confirmed_listing(observation) and _fresh(
-                        observation.observed_at, now, freshness
+                    if _confirmed_listing(persisted) and _fresh(
+                        persisted.observed_at, now, freshness
                     ):
-                        candidates.append(observation)
+                        candidates.append((saved.observation_id, persisted))
 
                 rows = repositories.observations.list_for_event(event_id)
-                for candidate in candidates:
+                for observation_id, candidate in candidates:
                     fresh_comparisons = tuple(
                         _observation_from_row(row, candidate.event_external_id)
                         for row in rows
@@ -319,7 +334,6 @@ class ScanCoordinator:
                         settings.budget_cap,
                         kickoff_at=event.starts_at,
                     )
-                    observation_id = repositories.observations.add(event_id, candidate)
                     opportunity_id = repositories.opportunities.save_estimate(
                         event_id, observation_id, estimate
                     )

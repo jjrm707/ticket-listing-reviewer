@@ -82,6 +82,25 @@ def test_duplicate_source_snapshot_is_idempotent(
     assert len(ObservationRepository(session).list_for_event(event_id)) == 1
 
 
+def test_observation_add_with_status_distinguishes_insert_from_conflicting_replay(
+    session, sample_event, sample_observation
+):
+    repository = ObservationRepository(session)
+    event_id = EventRepository(session).upsert(sample_event)
+
+    inserted = repository.add_with_status(event_id, sample_observation)
+    replayed = repository.add_with_status(
+        event_id,
+        replace(sample_observation, pair_price=Decimal("350.00")),
+    )
+
+    assert inserted.inserted is True
+    assert replayed.inserted is False
+    assert replayed.observation_id == inserted.observation_id
+    assert repository.add(event_id, sample_observation) == inserted.observation_id
+    assert repository.get(inserted.observation_id).pair_price == Decimal("220.00")
+
+
 def test_missing_listing_id_uses_stable_snapshot_identity(
     session, sample_event, sample_observation
 ):
