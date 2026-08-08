@@ -241,6 +241,34 @@ def test_refreshes_at_safety_window_and_does_not_reuse_short_lifetime(
     assert route.call_count == 3
 
 
+@pytest.mark.parametrize(
+    ("issued_at", "expires_in"),
+    [
+        (datetime.max.replace(tzinfo=timezone.utc), 3600),
+        (datetime.min.replace(tzinfo=timezone.utc), 1),
+    ],
+)
+@respx.mock
+def test_unrepresentable_cache_deadline_returns_token_without_caching(
+    client, token_json, issued_at, expires_in
+):
+    post_count = 0
+
+    def response(_request):
+        nonlocal post_count
+        post_count += 1
+        payload = copy.deepcopy(token_json)
+        payload.update(access_token=f"token-{post_count}", expires_in=expires_in)
+        return httpx.Response(200, json=payload)
+
+    route = respx.post(TOKEN_URL).mock(side_effect=response)
+    provider = StubHubTokenProvider(settings(), client, sleep=lambda _delay: None)
+
+    assert provider.get_token(issued_at) == "token-1"
+    assert provider.get_token(issued_at) == "token-2"
+    assert route.call_count == 2
+
+
 def test_token_provider_requires_aware_now(token_provider):
     with pytest.raises(ValueError, match="timezone-aware"):
         token_provider.get_token(NOW.replace(tzinfo=None))
@@ -265,6 +293,97 @@ def test_token_cache_is_concurrency_safe(client, token_json):
 
     assert tokens == ["access-token"] * 8
     assert calls == 1
+
+
+@respx.mock
+def test_waiter_two_hours_ahead_refreshes_instead_of_using_leader_token(
+    client, token_json
+):
+    first_request_started = threading.Event()
+    waiter_ready = threading.Event()
+    post_count = 0
+    post_lock = threading.Lock()
+
+    def response(_request):
+        nonlocal post_count
+        with post_lock:
+            post_count += 1
+            current = post_count
+        payload = copy.deepcopy(token_json)
+        payload["access_token"] = f"token-{current}"
+        if current == 1:
+            first_request_started.set()
+            assert waiter_ready.wait(timeout=2)
+            time.sleep(0.05)
+        return httpx.Response(200, json=payload)
+
+    route = respx.post(TOKEN_URL).mock(side_effect=response)
+    provider = StubHubTokenProvider(settings(), client, sleep=lambda _delay: None)
+
+    def waiting_call():
+        waiter_ready.set()
+        return provider.get_token(NOW + timedelta(hours=2))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        leader = pool.submit(provider.get_token, NOW)
+        assert first_request_started.wait(timeout=2)
+        waiter = pool.submit(waiting_call)
+        assert leader.result(timeout=3) == "token-1"
+        assert waiter.result(timeout=3) == "token-2"
+
+    assert route.call_count == 2
+
+
+@respx.mock
+def test_mixed_now_waiters_share_only_tokens_valid_for_each_caller(
+    client, token_json
+):
+    first_request_started = threading.Event()
+    all_waiters_ready = threading.Event()
+    waiter_count = 0
+    waiter_lock = threading.Lock()
+    post_count = 0
+    post_lock = threading.Lock()
+
+    def response(_request):
+        nonlocal post_count
+        with post_lock:
+            post_count += 1
+            current = post_count
+        payload = copy.deepcopy(token_json)
+        payload["access_token"] = f"token-{current}"
+        if current == 1:
+            first_request_started.set()
+            assert all_waiters_ready.wait(timeout=2)
+            time.sleep(0.05)
+        return httpx.Response(200, json=payload)
+
+    route = respx.post(TOKEN_URL).mock(side_effect=response)
+    provider = StubHubTokenProvider(settings(), client, sleep=lambda _delay: None)
+
+    def waiting_call(caller_now):
+        nonlocal waiter_count
+        with waiter_lock:
+            waiter_count += 1
+            if waiter_count == 8:
+                all_waiters_ready.set()
+        return provider.get_token(caller_now)
+
+    valid_times = [NOW + timedelta(minutes=5)] * 4
+    stale_times = [NOW + timedelta(hours=2)] * 4
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        leader = pool.submit(provider.get_token, NOW)
+        assert first_request_started.wait(timeout=2)
+        futures = [
+            pool.submit(waiting_call, caller_now)
+            for caller_now in valid_times + stale_times
+        ]
+        assert leader.result(timeout=3) == "token-1"
+        results = [future.result(timeout=3) for future in futures]
+
+    assert results[:4] == ["token-1"] * 4
+    assert results[4:] == ["token-2"] * 4
+    assert route.call_count == 2
 
 
 @pytest.mark.parametrize(

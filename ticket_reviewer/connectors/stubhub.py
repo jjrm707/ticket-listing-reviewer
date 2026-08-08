@@ -111,61 +111,72 @@ class StubHubTokenProvider:
         self._generation = 0
         self._generation_waiters: dict[int, int] = {}
         self._generation_results: dict[
-            int, tuple[str | None, BaseException | None]
+            int, tuple[str | None, datetime | None, BaseException | None]
         ] = {}
 
     def get_token(self, now: datetime) -> str:
         """Return a cached bearer token or acquire one using client credentials."""
         normalized_now = _aware_utc(now, "now must be timezone-aware")
-        with self._condition:
-            if (
-                self._token is not None
-                and self._reuse_before is not None
-                and normalized_now < self._reuse_before
-            ):
-                return self._token
-            if self._refreshing:
+        while True:
+            with self._condition:
+                if (
+                    self._token is not None
+                    and self._reuse_before is not None
+                    and normalized_now < self._reuse_before
+                ):
+                    return self._token
+                if self._refreshing:
+                    generation = self._generation
+                    self._generation_waiters[generation] = (
+                        self._generation_waiters.get(generation, 0) + 1
+                    )
+                    try:
+                        while (
+                            self._refreshing and self._generation == generation
+                        ):
+                            self._condition.wait()
+                        token, reuse_before, failure = self._generation_results[
+                            generation
+                        ]
+                    finally:
+                        remaining = self._generation_waiters[generation] - 1
+                        if remaining:
+                            self._generation_waiters[generation] = remaining
+                        else:
+                            self._generation_waiters.pop(generation, None)
+                            self._generation_results.pop(generation, None)
+                    if failure is not None:
+                        raise failure
+                    if token is None:
+                        raise AssertionError("token refresh completed without a result")
+                    if reuse_before is not None and normalized_now < reuse_before:
+                        return token
+                    continue
+                self._generation += 1
                 generation = self._generation
-                self._generation_waiters[generation] = (
-                    self._generation_waiters.get(generation, 0) + 1
-                )
-                try:
-                    while (
-                        self._refreshing and self._generation == generation
-                    ):
-                        self._condition.wait()
-                    token, failure = self._generation_results[generation]
-                finally:
-                    remaining = self._generation_waiters[generation] - 1
-                    if remaining:
-                        self._generation_waiters[generation] = remaining
-                    else:
-                        self._generation_waiters.pop(generation, None)
-                        self._generation_results.pop(generation, None)
-                if failure is not None:
-                    raise failure
-                if token is None:
-                    raise AssertionError("token refresh completed without a result")
-                return token
-            self._generation += 1
-            generation = self._generation
-            self._refreshing = True
+                self._refreshing = True
+                break
 
         try:
             token, expires_in = call_with_retry(self._acquire_token, self._sleep)
         except BaseException as error:
             with self._condition:
                 if self._generation_waiters.get(generation, 0):
-                    self._generation_results[generation] = (None, error)
+                    self._generation_results[generation] = (None, None, error)
                 self._refreshing = False
                 self._condition.notify_all()
             raise
 
         with self._condition:
+            reuse_before = _safe_reuse_deadline(normalized_now, expires_in)
             self._token = token
-            self._reuse_before = normalized_now + timedelta(seconds=expires_in - 60)
+            self._reuse_before = reuse_before
             if self._generation_waiters.get(generation, 0):
-                self._generation_results[generation] = (token, None)
+                self._generation_results[generation] = (
+                    token,
+                    reuse_before,
+                    None,
+                )
             self._refreshing = False
             self._condition.notify_all()
             return token
@@ -377,6 +388,16 @@ def _aware_utc(value: datetime, message: str) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError(message)
     return value.astimezone(timezone.utc)
+
+
+def _safe_reuse_deadline(issued_at: datetime, expires_in: int) -> datetime | None:
+    """Return a cache deadline, or disable reuse when it cannot be represented."""
+    if expires_in <= 60:
+        return None
+    try:
+        return issued_at + timedelta(seconds=expires_in - 60)
+    except OverflowError:
+        return None
 
 
 def _parse_token_payload(payload: Any) -> tuple[str, int]:
