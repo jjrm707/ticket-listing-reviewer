@@ -1,26 +1,62 @@
 """Read-only server-rendered dashboard routes."""
 
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+import hmac
+import io
+import ipaddress
+import os
 from pathlib import Path
 import re
+import secrets
+import stat
+from threading import Lock
+import unicodedata
+from urllib.parse import unquote, urlsplit, urlunsplit
+import warnings
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, aliased
+from starlette.datastructures import UploadFile
+from starlette.formparsers import MultiPartException, MultiPartParser
 
+from ticket_reviewer.data.repositories import (
+    EventRepository,
+    ObservationRepository,
+    OpportunityRepository,
+    SettingRepository,
+)
 from ticket_reviewer.data.schema import (
     ConnectorRunRow,
     EventRow,
+    ManualReviewRow,
     ObservationRow,
     OpportunityRow,
     SourceEventRow,
 )
-from ticket_reviewer.domain.enums import Confidence, OpportunityStatus, Source, Team
+from ticket_reviewer.domain.enums import (
+    Confidence,
+    ObservationKind,
+    OpportunityStatus,
+    Source,
+    Team,
+)
+from ticket_reviewer.domain.matching import event_match_score, normalize_label
+from ticket_reviewer.domain.models import ExternalEvent, SourceObservation
+from ticket_reviewer.domain.scoring import estimate_opportunity
+from ticket_reviewer.services.ocr import (
+    ManualReviewDraft,
+    normalize_ocr_text,
+    parse_listing_text,
+)
 
 from .viewmodels import (
     EventEstimate,
@@ -50,6 +86,40 @@ _FILTER_NAMES = frozenset(
 )
 _MONEY = re.compile(r"-?(?:0|[1-9]\d{0,8})(?:\.\d{1,2})?")
 _POSITIVE_ID = re.compile(r"[1-9]\d{0,8}")
+_UPLOAD_LIMIT = 10 * 1024 * 1024
+_UPLOAD_CHUNK = 64 * 1024
+_MAX_IMAGE_PIXELS = 40_000_000
+_MAX_IMAGE_DIMENSION = 12_000
+_MAX_METADATA_BYTES = 64_000
+_MAX_REFERENCE_URL = 2048
+_STAGED_TTL = timedelta(hours=24)
+_REVIEW_FILE = re.compile(r"[0-9a-f]{32}\.(?:png|jpg)")
+_FORM_MONEY = re.compile(r"(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?")
+_SAFE_TEXT = re.compile(r"[^\x00-\x1f\x7f-\x9f\ud800-\udfff]+")
+_EVENT_MATCH_THRESHOLD = Decimal("0.85")
+_HOME_VENUES = {
+    Team.TEXANS: frozenset({"nrg stadium", "reliant stadium"}),
+    Team.AGGIES: frozenset({"kyle field"}),
+}
+
+
+class _OversizeUpload(MultiPartException):
+    pass
+
+
+class _BoundedMultiPartParser(MultiPartParser):
+    """Stop file spooling as soon as one upload crosses the local limit."""
+
+    def on_part_begin(self) -> None:
+        super().on_part_begin()
+        self._current_file_bytes = 0
+
+    def on_part_data(self, data: bytes, start: int, end: int) -> None:
+        if self._current_part.file is not None:
+            self._current_file_bytes += end - start
+            if self._current_file_bytes > _UPLOAD_LIMIT:
+                raise _OversizeUpload("Upload exceeded the local size limit")
+        super().on_part_data(data, start, end)
 
 
 def _bad_filter() -> HTTPException:
@@ -129,6 +199,874 @@ def dashboard_context(request: Request):
         )
     finally:
         session.close()
+
+
+def _manual_error(status_code: int = 400) -> HTTPException:
+    return HTTPException(status_code=status_code, detail="Invalid manual review request")
+
+
+def _contains_control(value: str) -> bool:
+    return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _csrf(request: Request, values: dict[str, list[object]]) -> None:
+    supplied = values.get("csrf_token", [])
+    expected = getattr(request.app.state, "manual_csrf_token", "")
+    if (
+        len(supplied) != 1
+        or not isinstance(supplied[0], str)
+        or len(supplied[0]) > 128
+        or not supplied[0].isascii()
+        or not isinstance(expected, str)
+        or not expected.isascii()
+        or not hmac.compare_digest(supplied[0], expected)
+    ):
+        raise _manual_error()
+
+
+async def _form_values(request: Request, *, multipart: bool) -> dict[str, list[object]]:
+    try:
+        if multipart:
+            form = await _BoundedMultiPartParser(
+                request.headers,
+                request.stream(),
+                max_files=1,
+                max_fields=32,
+                max_part_size=4096,
+            ).parse()
+        else:
+            form = await request.form(max_files=0, max_fields=32, max_part_size=4096)
+    except _OversizeUpload:
+        raise _manual_error(413) from None
+    except Exception:
+        raise _manual_error() from None
+    values: dict[str, list[object]] = defaultdict(list)
+    try:
+        for name, value in form.multi_items():
+            if not isinstance(name, str) or len(name) > 80:
+                raise _manual_error()
+            values[name].append(value)
+    except Exception:
+        await _close_uploads(value for _name, value in form.multi_items())
+        raise
+    return values
+
+
+async def _close_uploads(items) -> None:
+    closed: set[int] = set()
+    for item in items:
+        identity = id(item)
+        if isinstance(item, UploadFile) and identity not in closed:
+            closed.add(identity)
+            await item.close()
+
+
+def _single_text(
+    values: dict[str, list[object]],
+    name: str,
+    *,
+    required: bool = True,
+    max_length: int = 256,
+) -> str:
+    items = values.get(name, [])
+    if len(items) != 1 or not isinstance(items[0], str):
+        if not required and not items:
+            return ""
+        raise _manual_error()
+    value = items[0].strip()
+    if (
+        len(value) > max_length
+        or (value and _SAFE_TEXT.fullmatch(value) is None)
+        or _contains_control(value)
+    ):
+        raise _manual_error()
+    if required and not value:
+        raise _manual_error()
+    return value
+
+
+def _reference_url(value: str) -> str:
+    if not value:
+        return ""
+    if (
+        len(value) > _MAX_REFERENCE_URL
+        or _SAFE_TEXT.fullmatch(value) is None
+        or _contains_control(value)
+    ):
+        raise _manual_error()
+    try:
+        parsed = urlsplit(value)
+        host = parsed.hostname
+        port = parsed.port
+    except (UnicodeError, ValueError):
+        raise _manual_error() from None
+    if (
+        parsed.scheme.casefold() not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or not parsed.netloc
+    ):
+        raise _manual_error()
+    decoded_components = unquote(unquote(f"{parsed.path}?{parsed.query}"))
+    if decoded_components and (
+        _SAFE_TEXT.fullmatch(decoded_components) is None
+        or _contains_control(decoded_components)
+    ):
+        raise _manual_error()
+    folded_host = host.rstrip(".").casefold()
+    if (
+        folded_host in {"localhost", "localhost.localdomain"}
+        or folded_host.endswith(".local")
+        or folded_host.startswith(("0x", "+", "-"))
+    ):
+        raise _manual_error()
+    try:
+        address = ipaddress.ip_address(folded_host.strip("[]"))
+    except ValueError:
+        address = None
+    if address is None and re.fullmatch(r"[0-9.]+", folded_host) is not None:
+        raise _manual_error()
+    if address is not None and not address.is_global:
+        raise _manual_error()
+    safe_host = f"[{folded_host}]" if ":" in folded_host else folded_host
+    netloc = safe_host if port is None else f"{safe_host}:{port}"
+    return urlunsplit((parsed.scheme.casefold(), netloc, parsed.path or "/", parsed.query, ""))
+
+
+def _decode_upload(data: bytes, mime: str) -> tuple[bytes, str]:
+    expected = {"image/png": ("PNG", ".png"), "image/jpeg": ("JPEG", ".jpg")}.get(mime)
+    if expected is None:
+        raise _manual_error(415)
+    if mime == "image/png":
+        if not data.startswith(b"\x89PNG\r\n\x1a\n") or not data.endswith(
+            b"\x00\x00\x00\x00IEND\xaeB`\x82"
+        ):
+            raise _manual_error()
+    elif not data.startswith(b"\xff\xd8\xff") or not data.endswith(b"\xff\xd9"):
+        raise _manual_error()
+    normalized: Image.Image | None = None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            with Image.open(io.BytesIO(data)) as image:
+                if image.format != expected[0] or getattr(image, "n_frames", 1) != 1:
+                    raise _manual_error()
+                width, height = image.size
+                metadata_size = sum(
+                    len(str(key)) + len(str(value)) for key, value in image.info.items()
+                )
+                if (
+                    width <= 0
+                    or height <= 0
+                    or width > _MAX_IMAGE_DIMENSION
+                    or height > _MAX_IMAGE_DIMENSION
+                    or width * height > _MAX_IMAGE_PIXELS
+                    or metadata_size > _MAX_METADATA_BYTES
+                ):
+                    raise _manual_error()
+                image.load()
+                oriented = ImageOps.exif_transpose(image)
+                try:
+                    normalized = oriented.convert("RGB")
+                finally:
+                    if oriented is not image:
+                        oriented.close()
+        with io.BytesIO() as output:
+            if expected[0] == "PNG":
+                normalized.save(output, format="PNG", optimize=False, compress_level=6)
+            else:
+                normalized.save(output, format="JPEG", quality=90, optimize=False, progressive=False)
+            safe_bytes = output.getvalue()
+        if len(safe_bytes) > _UPLOAD_LIMIT:
+            raise _manual_error(413)
+        return safe_bytes, expected[1]
+    except HTTPException:
+        raise
+    except (
+        OSError,
+        UnidentifiedImageError,
+        Image.DecompressionBombError,
+        Image.DecompressionBombWarning,
+    ):
+        raise _manual_error() from None
+    except Exception:
+        raise _manual_error() from None
+    finally:
+        if normalized is not None:
+            normalized.close()
+
+
+def _screenshot_root(request: Request) -> Path:
+    configured = Path(request.app.state.settings.screenshot_directory)
+    if configured.exists() and (configured.is_symlink() or not configured.is_dir()):
+        raise _manual_error(500)
+    try:
+        configured.mkdir(exist_ok=True)
+        root = configured.resolve(strict=True)
+    except OSError:
+        raise _manual_error(500) from None
+    if root.is_symlink() or not root.is_dir():
+        raise _manual_error(500)
+    return root
+
+
+def _write_screenshot(request: Request, data: bytes, suffix: str) -> tuple[str, Path]:
+    root = _screenshot_root(request)
+    name = f"{secrets.token_hex(16)}{suffix}"
+    path = root / name
+    if path.parent != root:
+        raise _manual_error(500)
+    try:
+        with path.open("xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        details = path.lstat()
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
+            raise OSError
+    except OSError:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise _manual_error(500) from None
+    return name, path
+
+
+def _draft_payload(draft: ManualReviewDraft, reference_url: str, staged_at: datetime) -> dict:
+    return {
+        "state": "unconfirmed",
+        "staged_at": staged_at.isoformat(),
+        "reference_url": reference_url,
+        "draft": {
+            "event": draft.event,
+            "team": draft.team,
+            "opponent": draft.opponent,
+            "marketplace": draft.marketplace,
+            "kickoff": draft.kickoff_text,
+            "venue": draft.venue,
+            "section": draft.section,
+            "row": draft.row,
+            "quantity": draft.quantity,
+            "per_ticket_price": str(draft.per_ticket_price) if draft.per_ticket_price is not None else None,
+            "fees": str(draft.fees) if draft.fees is not None else None,
+            "tax": str(draft.tax) if draft.tax is not None else None,
+            "total": str(draft.total) if draft.total is not None else None,
+        },
+    }
+
+
+def _manual_session(request: Request) -> Session:
+    services = getattr(request.app.state, "services", None)
+    factory = getattr(services, "session_factory", None)
+    if not callable(factory):
+        raise _manual_error(503)
+    return factory()
+
+
+def _safe_review_path(request: Request, stored: object) -> Path:
+    if not isinstance(stored, str) or _REVIEW_FILE.fullmatch(stored) is None:
+        raise _manual_error(500)
+    root = _screenshot_root(request)
+    path = root / stored
+    if path.parent != root or path.is_symlink():
+        raise _manual_error(500)
+    return path
+
+
+@dataclass(frozen=True, slots=True)
+class _ReviewSnapshot:
+    id: int
+    screenshot_path: str
+    ocr_text: str | None
+    corrected_payload: dict | None
+    confirmed_at: datetime | None
+
+
+def _review_snapshot(row: ManualReviewRow) -> _ReviewSnapshot:
+    return _ReviewSnapshot(
+        id=row.id,
+        screenshot_path=row.screenshot_path,
+        ocr_text=row.ocr_text,
+        corrected_payload=deepcopy(row.corrected_payload),
+        confirmed_at=row.confirmed_at,
+    )
+
+
+def _restore_review(session: Session, snapshot: _ReviewSnapshot) -> None:
+    session.add(
+        ManualReviewRow(
+            id=snapshot.id,
+            screenshot_path=snapshot.screenshot_path,
+            ocr_text=snapshot.ocr_text,
+            corrected_payload=deepcopy(snapshot.corrected_payload),
+            confirmed_at=snapshot.confirmed_at,
+        )
+    )
+    session.commit()
+
+
+def _delete_private_review(request: Request, session: Session, row: ManualReviewRow) -> None:
+    """Delete DB state first, restoring it if the still-private file cannot be unlinked."""
+    snapshot = _review_snapshot(row)
+    original = _safe_review_path(request, row.screenshot_path)
+    if original.exists():
+        details = original.lstat()
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or original.is_symlink()
+        ):
+            raise _manual_error(500)
+    session.delete(row)
+    session.commit()
+    if not original.exists():
+        return
+    try:
+        original.unlink()
+    except OSError:
+        try:
+            _restore_review(session, snapshot)
+        except Exception as restore_error:
+            session.rollback()
+            raise RuntimeError("manual review compensation failed") from restore_error
+        raise _manual_error(500) from None
+
+
+def _purge_stale_reviews(request: Request, now: datetime) -> None:
+    session: Session | None = None
+    try:
+        session = _manual_session(request)
+        rows = list(
+            session.scalars(
+                select(ManualReviewRow)
+                .where(ManualReviewRow.confirmed_at.is_(None))
+                .order_by(ManualReviewRow.id)
+                .limit(50)
+            )
+        )
+        for row in rows:
+            payload = row.corrected_payload
+            if not isinstance(payload, dict) or payload.get("state") != "unconfirmed":
+                continue
+            staged_raw = payload.get("staged_at")
+            if not isinstance(staged_raw, str) or len(staged_raw) > 64:
+                continue
+            try:
+                staged_at = datetime.fromisoformat(staged_raw)
+                if staged_at.tzinfo is None or staged_at.utcoffset() is None:
+                    continue
+                expired = now - staged_at.astimezone(timezone.utc) > _STAGED_TTL
+            except (ValueError, OverflowError):
+                continue
+            if not expired:
+                continue
+            try:
+                lock = _confirmation_lock(request, row.id)
+                with lock:
+                    session.refresh(row)
+                    if row.confirmed_at is None:
+                        _delete_private_review(request, session, row)
+            except Exception:
+                session.rollback()
+    except Exception:
+        if session is not None:
+            session.rollback()
+    finally:
+        if session is not None:
+            session.close()
+
+
+@router.get("/manual", response_class=HTMLResponse)
+def manual_review(request: Request):
+    return templates.TemplateResponse(
+        request,
+        "manual_review.html",
+        {"csrf_token": request.app.state.manual_csrf_token},
+    )
+
+
+@router.post("/manual/extract", response_class=HTMLResponse)
+async def manual_extract(request: Request):
+    values = await _form_values(request, multipart=True)
+    try:
+        _csrf(request, values)
+        uploads = values.get("screenshot", [])
+        if len(uploads) != 1 or not isinstance(uploads[0], UploadFile):
+            raise _manual_error()
+        upload = uploads[0]
+        if upload.content_type not in {"image/png", "image/jpeg"}:
+            raise _manual_error(415)
+        reference = _reference_url(
+            _single_text(values, "reference_url", required=False, max_length=_MAX_REFERENCE_URL)
+        )
+        _purge_stale_reviews(request, _now(request))
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = await upload.read(min(_UPLOAD_CHUNK, _UPLOAD_LIMIT + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if total > _UPLOAD_LIMIT:
+                raise _manual_error(413)
+        safe_bytes, suffix = _decode_upload(b"".join(chunks), upload.content_type)
+    finally:
+        await _close_uploads(
+            item for items in values.values() for item in items
+        )
+    stored_name = ""
+    stored_path: Path | None = None
+    session: Session | None = None
+    try:
+        stored_name, stored_path = _write_screenshot(request, safe_bytes, suffix)
+        engine = getattr(request.app.state, "ocr_engine", None)
+        if engine is None or not callable(getattr(engine, "extract_text", None)):
+            raise _manual_error(503)
+        ocr_text = normalize_ocr_text(engine.extract_text(stored_path))
+        draft = parse_listing_text(ocr_text)
+        staged_at = _now(request)
+        session = _manual_session(request)
+        review = ManualReviewRow(
+            screenshot_path=stored_name,
+            ocr_text=ocr_text,
+            corrected_payload=_draft_payload(draft, reference, staged_at),
+            confirmed_at=None,
+        )
+        session.add(review)
+        session.flush()
+        review_id = review.id
+        session.commit()
+    except HTTPException:
+        if session is not None:
+            session.rollback()
+        if stored_path is not None:
+            try:
+                stored_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise
+    except Exception:
+        if session is not None:
+            session.rollback()
+        if stored_path is not None:
+            try:
+                stored_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        raise _manual_error(422) from None
+    finally:
+        if session is not None:
+            session.close()
+    return templates.TemplateResponse(
+        request,
+        "manual_confirm.html",
+        {
+            "csrf_token": request.app.state.manual_csrf_token,
+            "review_id": review_id,
+            "draft": draft,
+            "reference_url": reference,
+            "result": None,
+        },
+    )
+
+
+def _money_form(value: str, *, required: bool) -> Decimal | None:
+    if not value:
+        if required:
+            raise _manual_error()
+        return None
+    if _FORM_MONEY.fullmatch(value) is None:
+        raise _manual_error()
+    try:
+        parsed = Decimal(value).quantize(Decimal("0.01"))
+    except (InvalidOperation, ValueError):
+        raise _manual_error() from None
+    if not parsed.is_finite() or parsed <= 0:
+        raise _manual_error()
+    return parsed
+
+
+def _kickoff(value: str, now: datetime, timezone_name: str) -> datetime:
+    if re.search(r"[+-]\d{2}:\d{2}$", value) is None:
+        raise _manual_error()
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, OverflowError):
+        raise _manual_error() from None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise _manual_error()
+    try:
+        wall = parsed.replace(tzinfo=None)
+        local_zone = ZoneInfo(timezone_name)
+        possible_offsets = {
+            wall.replace(tzinfo=local_zone, fold=0).utcoffset(),
+            wall.replace(tzinfo=local_zone, fold=1).utcoffset(),
+        }
+        if len(possible_offsets) != 1 or parsed.utcoffset() not in possible_offsets:
+            raise _manual_error()
+        utc_value = parsed.astimezone(timezone.utc)
+        if utc_value <= now or utc_value > now + timedelta(days=366):
+            raise _manual_error()
+    except HTTPException:
+        raise
+    except (OverflowError, ValueError):
+        raise _manual_error() from None
+    return utc_value
+
+
+@dataclass(frozen=True, slots=True)
+class _ConfirmedInput:
+    event: str
+    team: Team
+    opponent: str
+    marketplace: str
+    reference_url: str
+    kickoff: datetime
+    venue: str
+    section: str | None
+    row: str | None
+    per_ticket_price: Decimal | None
+    fees: Decimal | None
+    tax: Decimal | None
+    total: Decimal
+
+
+def _confirmed_input(
+    request: Request,
+    values: dict[str, list[object]],
+    effective_budget: Decimal,
+    now: datetime,
+) -> _ConfirmedInput:
+    event = _single_text(values, "event", max_length=160)
+    team_raw = _single_text(values, "team", max_length=16)
+    try:
+        team = Team(team_raw)
+    except ValueError:
+        raise _manual_error() from None
+    opponent = _single_text(values, "opponent", max_length=80)
+    venue = _single_text(values, "venue", max_length=128)
+    normalized_event = normalize_label(event)
+    normalized_opponent = normalize_label(opponent)
+    event_pattern = (
+        r"(?:houston )?texans vs (.+)"
+        if team is Team.TEXANS
+        else r"(?:texas a m(?: aggies)?|aggies) vs (.+)"
+    )
+    event_match = re.fullmatch(event_pattern, normalized_event)
+    exact_opponent = event_match.group(1) if event_match is not None else None
+    opponent_is_supported = bool(
+        re.search(r"\b(?:houston )?texans\b|\b(?:texas a m(?: aggies)?|aggies)\b", normalized_opponent)
+    )
+    if (
+        exact_opponent != normalized_opponent
+        or opponent_is_supported
+        or re.search(r"\b(?:parking|pass|away|neutral| at )\b", event, re.IGNORECASE)
+        or normalize_label(venue) not in _HOME_VENUES[team]
+    ):
+        raise _manual_error()
+    quantity = _single_text(values, "quantity", max_length=8)
+    if quantity != "2":
+        raise _manual_error()
+    total = _money_form(_single_text(values, "total", max_length=32), required=True)
+    assert total is not None
+    cap = min(Decimal("400.00"), effective_budget)
+    if total > cap:
+        raise _manual_error()
+    marketplace = _single_text(values, "marketplace", required=False, max_length=80)
+    reference = _reference_url(
+        _single_text(values, "reference_url", required=False, max_length=_MAX_REFERENCE_URL)
+    )
+    section = _single_text(values, "section", required=False, max_length=64) or None
+    row = _single_text(values, "row", required=False, max_length=64) or None
+    kickoff = _kickoff(
+        _single_text(values, "kickoff", max_length=64),
+        now,
+        request.app.state.settings.timezone,
+    )
+    return _ConfirmedInput(
+        event=event,
+        team=team,
+        opponent=opponent,
+        marketplace=marketplace,
+        reference_url=reference,
+        kickoff=kickoff,
+        venue=venue,
+        section=section,
+        row=row,
+        per_ticket_price=_money_form(
+            _single_text(values, "per_ticket_price", required=False, max_length=32),
+            required=False,
+        ),
+        fees=_money_form(
+            _single_text(values, "fees", required=False, max_length=32),
+            required=False,
+        ),
+        tax=_money_form(
+            _single_text(values, "tax", required=False, max_length=32),
+            required=False,
+        ),
+        total=total,
+    )
+
+
+def _event_from_row(row: EventRow) -> ExternalEvent:
+    return ExternalEvent(
+        source=Source.MANUAL,
+        external_id=f"canonical:{row.id}",
+        team=Team(row.team),
+        opponent=row.opponent,
+        venue=row.venue,
+        starts_at=row.starts_at,
+        is_home=row.is_home,
+        is_parking=False,
+        url=None,
+    )
+
+
+def _manual_event(
+    repositories: EventRepository,
+    review_id: int,
+    corrected: _ConfirmedInput,
+) -> tuple[int, str]:
+    external_id = f"manual-review:{review_id}"
+    incoming = ExternalEvent(
+        source=Source.MANUAL,
+        external_id=external_id,
+        team=corrected.team,
+        opponent=corrected.opponent,
+        venue=corrected.venue,
+        starts_at=corrected.kickoff,
+        is_home=True,
+        is_parking=False,
+        url=None,
+    )
+    existing = repositories.find_by_source(Source.MANUAL, external_id)
+    if existing is not None:
+        return repositories.upsert(incoming), external_id
+    matches = [
+        row
+        for row in repositories.list_for_team(corrected.team)
+        if event_match_score(incoming, _event_from_row(row)) >= _EVENT_MATCH_THRESHOLD
+    ]
+    if len(matches) > 1:
+        raise _manual_error()
+    event_id = repositories.upsert(
+        incoming,
+        canonical_event_id=matches[0].id if matches else None,
+    )
+    return event_id, external_id
+
+
+def _observation(row: ObservationRow, event_external_id: str) -> SourceObservation:
+    return SourceObservation(
+        source=Source(row.source),
+        event_external_id=event_external_id,
+        observed_at=row.observed_at,
+        kind=ObservationKind(row.kind),
+        currency=row.currency,
+        pair_price=row.pair_price,
+        buyer_fees=row.buyer_fees,
+        estimated_tax=row.estimated_tax,
+        section=row.section,
+        row=row.row,
+        quantity_available=row.quantity_available,
+        can_buy_pair=row.can_buy_pair,
+        listing_id=row.listing_id,
+        listing_url=row.listing_url,
+        listing_count=row.listing_count,
+        popularity=row.popularity,
+        observation_id=row.id,
+    )
+
+
+def _confirmation_lock(request: Request, review_id: int) -> Lock:
+    guard = request.app.state.manual_confirmation_guard
+    with guard:
+        locks = request.app.state.manual_confirmation_locks
+        lock = locks.get(review_id)
+        if lock is None:
+            lock = Lock()
+            locks[review_id] = lock
+        return lock
+
+
+def _result_context(request: Request, review_id: int, payload: dict, *, repeated: bool):
+    return templates.TemplateResponse(
+        request,
+        "manual_confirm.html",
+        {
+            "csrf_token": request.app.state.manual_csrf_token,
+            "review_id": review_id,
+            "result": {
+                "message": (
+                    "This review was already confirmed; no duplicate estimate was created."
+                    if repeated
+                    else "The corrected pair was scored and saved."
+                ),
+                "event_id": payload.get("event_id"),
+                "opportunity_id": payload.get("opportunity_id"),
+            },
+        },
+    )
+
+
+@router.post("/manual/confirm", response_class=HTMLResponse)
+async def manual_confirm(request: Request):
+    values = await _form_values(request, multipart=False)
+    _csrf(request, values)
+    review_raw = _single_text(values, "review_id", max_length=9)
+    if _POSITIVE_ID.fullmatch(review_raw) is None:
+        raise _manual_error()
+    review_id = int(review_raw)
+    lock = _confirmation_lock(request, review_id)
+    with lock:
+        session = _manual_session(request)
+        opportunity_id: int | None = None
+        try:
+            review = session.get(ManualReviewRow, review_id)
+            if review is None:
+                raise _manual_error(404)
+            if review.confirmed_at is not None:
+                payload = review.corrected_payload if isinstance(review.corrected_payload, dict) else {}
+                return _result_context(request, review_id, payload, repeated=True)
+            now = _now(request)
+            effective = SettingRepository(session).effective(request.app.state.settings)
+            corrected = _confirmed_input(request, values, effective.budget_cap, now)
+            events = EventRepository(session)
+            observations = ObservationRepository(session)
+            opportunities_repo = OpportunityRepository(session)
+            event_id, external_id = _manual_event(events, review_id, corrected)
+            candidate = SourceObservation(
+                source=Source.MANUAL,
+                event_external_id=external_id,
+                observed_at=now,
+                kind=ObservationKind.LISTING,
+                currency="USD",
+                pair_price=corrected.total,
+                buyer_fees=Decimal("0.00"),
+                estimated_tax=Decimal("0.00"),
+                section=corrected.section,
+                row=corrected.row,
+                quantity_available=2,
+                can_buy_pair=True,
+                listing_id=f"manual-review:{review_id}",
+                listing_url=None,
+            )
+            saved = observations.add_with_status(event_id, candidate)
+            candidate_row = observations.get(saved.observation_id)
+            if candidate_row is None:
+                raise RuntimeError
+            persisted_candidate = _observation(candidate_row, external_id)
+            freshness = timedelta(minutes=effective.observation_freshness_minutes)
+            comparable_rows = list(
+                session.scalars(
+                    select(ObservationRow)
+                    .where(
+                        ObservationRow.event_id == event_id,
+                        ObservationRow.observed_at >= now - freshness,
+                        ObservationRow.observed_at <= now + timedelta(minutes=5),
+                    )
+                    .order_by(ObservationRow.observed_at, ObservationRow.id)
+                )
+            )
+            comparables = tuple(
+                _observation(row, external_id)
+                for row in comparable_rows
+            )
+            estimate = estimate_opportunity(
+                persisted_candidate,
+                comparables,
+                {
+                    Source.STUBHUB: effective.stubhub_seller_fee_rate,
+                    Source.TICKETMASTER: effective.ticketmaster_seller_fee_rate,
+                    Source.SEATGEEK: effective.seatgeek_seller_fee_rate,
+                },
+                now,
+                effective.budget_cap,
+                kickoff_at=corrected.kickoff,
+            )
+            opportunity_id = opportunities_repo.save_estimate(
+                event_id, saved.observation_id, estimate
+            )
+            payload = {
+                "state": "confirmed",
+                "event": corrected.event,
+                "team": corrected.team.value,
+                "opponent": corrected.opponent,
+                "marketplace": corrected.marketplace,
+                "reference_url": corrected.reference_url,
+                "kickoff": corrected.kickoff.isoformat(),
+                "venue": corrected.venue,
+                "section": corrected.section,
+                "row": corrected.row,
+                "quantity": 2,
+                "per_ticket_price": str(corrected.per_ticket_price) if corrected.per_ticket_price is not None else None,
+                "fees": str(corrected.fees) if corrected.fees is not None else None,
+                "tax": str(corrected.tax) if corrected.tax is not None else None,
+                "total": str(corrected.total),
+                "event_id": event_id,
+                "opportunity_id": opportunity_id,
+            }
+            review.corrected_payload = payload
+            review.confirmed_at = now
+            session.commit()
+        except HTTPException:
+            session.rollback()
+            raise
+        except Exception:
+            session.rollback()
+            raise _manual_error(500) from None
+        finally:
+            session.close()
+    services = getattr(request.app.state, "services", None)
+    alert_service = getattr(services, "alert_service", None)
+    if estimate.actionable and alert_service is not None:
+        try:
+            alert_service.evaluate_and_send(opportunity_id, now)
+        except Exception:
+            pass
+    return _result_context(request, review_id, payload, repeated=False)
+
+
+@router.post("/manual/{review_id}/delete", response_class=HTMLResponse)
+async def manual_delete(request: Request, review_id: str):
+    if _POSITIVE_ID.fullmatch(review_id) is None:
+        raise _manual_error(404)
+    values = await _form_values(request, multipart=False)
+    _csrf(request, values)
+    numeric_id = int(review_id)
+    lock = _confirmation_lock(request, numeric_id)
+    with lock:
+        session = _manual_session(request)
+        try:
+            review = session.get(ManualReviewRow, numeric_id)
+            if review is None:
+                raise _manual_error(404)
+            _delete_private_review(request, session, review)
+        except HTTPException:
+            session.rollback()
+            raise
+        except Exception:
+            session.rollback()
+            raise _manual_error(500) from None
+        finally:
+            session.close()
+    return templates.TemplateResponse(
+        request,
+        "manual_confirm.html",
+        {
+            "csrf_token": request.app.state.manual_csrf_token,
+            "review_id": numeric_id,
+            "result": {
+                "message": "Private screenshot and corrected review deleted; scoring and opportunity history remains.",
+                "event_id": None,
+                "opportunity_id": None,
+            },
+        },
+    )
 
 
 @router.get("/", response_class=HTMLResponse)

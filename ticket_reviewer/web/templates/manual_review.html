@@ -1,0 +1,19 @@
+{% extends "base.html" %}
+{% block title %}Manual review — Ticket Listing Reviewer{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">Local OCR</p>
+  <h1>Manual review</h1>
+  <p>Upload one local PNG or JPEG screenshot. The image and OCR text stay on this computer, and an optional reference URL is stored without being opened.</p>
+</section>
+<form class="manual-form" action="/manual/extract" method="post" enctype="multipart/form-data">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <label for="screenshot">Listing screenshot <span aria-hidden="true">*</span></label>
+  <input id="screenshot" type="file" name="screenshot" accept="image/png,image/jpeg" required>
+  <p class="field-note" id="screenshot-note">PNG or JPEG, up to 10 MiB. Animated images are not accepted.</p>
+  <label for="reference_url">Optional reference URL</label>
+  <input id="reference_url" type="url" name="reference_url" maxlength="2048" inputmode="url" placeholder="https://…">
+  <p class="field-note">Stored only as an inert private reference; never fetched or sent in an alert.</p>
+  <button type="submit">Extract local suggestions</button>
+</form>
+{% endblock %}

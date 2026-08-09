@@ -1,0 +1,72 @@
+{% extends "base.html" %}
+{% block title %}Confirm manual review — Ticket Listing Reviewer{% endblock %}
+{% block content %}
+{% if result %}
+<section class="hero">
+  <p class="eyebrow">Manual review</p>
+  <h1>Review confirmed</h1>
+  <p>{{ result.message }}</p>
+  {% if result.opportunity_id %}<p><a href="/events/{{ result.event_id }}">View the saved event and estimate</a></p>{% endif %}
+</section>
+<form class="manual-form compact-form" action="/manual/{{ review_id }}/delete" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <button class="danger-button" type="submit">Delete private screenshot and review</button>
+  <p class="field-note">Scoring and opportunity history remains after the private image and corrected OCR record are deleted.</p>
+</form>
+{% else %}
+<section class="hero">
+  <p class="eyebrow">Confirm before scoring</p>
+  <h1>Check every field</h1>
+  <p class="suggestion-warning"><strong>Screenshot details are suggestions—confirm every field.</strong> Nothing is scored until this form passes validation.</p>
+</section>
+{% if draft.warnings %}
+<section class="review-notices" aria-labelledby="warning-heading">
+  <h2 id="warning-heading">OCR warnings</h2>
+  <ul>{% for warning in draft.warnings %}<li>{{ warning }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+{% if draft.missing_fields %}
+<section class="review-notices" aria-labelledby="missing-heading">
+  <h2 id="missing-heading">Needs confirmation</h2>
+  <ul>{% for field in draft.missing_fields %}<li>{{ field }}</li>{% endfor %}</ul>
+</section>
+{% endif %}
+<form class="manual-form confirmation-grid" action="/manual/confirm" method="post">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <input type="hidden" name="review_id" value="{{ review_id }}">
+  <label for="event">Event</label>
+  <input id="event" name="event" maxlength="160" required value="{{ draft.event or '' }}">
+  <label for="team">Supported team</label>
+  <select id="team" name="team" required>
+    <option value="">Choose a team</option>
+    <option value="texans"{% if draft.team == 'texans' %} selected{% endif %}>Houston Texans</option>
+    <option value="aggies"{% if draft.team == 'aggies' %} selected{% endif %}>Texas A&amp;M football</option>
+  </select>
+  <label for="opponent">Opponent</label>
+  <input id="opponent" name="opponent" maxlength="80" required value="{{ draft.opponent or '' }}">
+  <label for="venue">Home venue</label>
+  <input id="venue" name="venue" maxlength="128" required value="{{ draft.venue or '' }}" placeholder="NRG Stadium or Kyle Field">
+  <label for="kickoff">Kickoff with numeric UTC offset</label>
+  <input id="kickoff" name="kickoff" maxlength="64" required value="{{ draft.kickoff_text or '' }}" placeholder="2026-09-13T12:00:00-05:00">
+  <label for="marketplace">Marketplace</label>
+  <input id="marketplace" name="marketplace" maxlength="80" value="{{ draft.marketplace or '' }}">
+  <label for="reference_url">Private reference URL</label>
+  <input id="reference_url" name="reference_url" maxlength="2048" type="url" value="{{ reference_url }}">
+  <label for="section">Section</label>
+  <input id="section" name="section" maxlength="64" value="{{ draft.section or '' }}">
+  <label for="row">Row</label>
+  <input id="row" name="row" maxlength="64" value="{{ draft.row or '' }}">
+  <label for="quantity">Quantity</label>
+  <input id="quantity" name="quantity" inputmode="numeric" required value="{{ draft.quantity if draft.quantity is not none else '' }}">
+  <label for="per_ticket_price">Per-ticket price (explanation only)</label>
+  <input id="per_ticket_price" name="per_ticket_price" inputmode="decimal" value="{{ draft.per_ticket_price if draft.per_ticket_price is not none else '' }}">
+  <label for="fees">Fees (explanation only)</label>
+  <input id="fees" name="fees" inputmode="decimal" value="{{ draft.fees if draft.fees is not none else '' }}">
+  <label for="tax">Tax (explanation only)</label>
+  <input id="tax" name="tax" inputmode="decimal" value="{{ draft.tax if draft.tax is not none else '' }}">
+  <label for="total">Explicit all-in pair total</label>
+  <input id="total" name="total" inputmode="decimal" required value="{{ draft.total if draft.total is not none else '' }}">
+  <button type="submit">Confirm and score this pair</button>
+</form>
+{% endif %}
+{% endblock %}

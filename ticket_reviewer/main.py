@@ -4,6 +4,8 @@ from collections.abc import Callable
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
+import secrets
+from threading import Lock
 from typing import Any, Protocol
 
 from alembic import command
@@ -17,6 +19,7 @@ from sqlalchemy.engine import make_url
 from ticket_reviewer.bootstrap import ApplicationServices, build_services
 from ticket_reviewer.config import Settings
 from ticket_reviewer.services.scheduler import build_scheduler
+from ticket_reviewer.services.ocr import OcrEngine, TesseractOcrEngine
 from ticket_reviewer.web import router as web_router
 from ticket_reviewer.web.routes import templates as web_templates
 
@@ -74,6 +77,7 @@ def create_app(
     services_factory: Callable[[Settings], ApplicationServices] = build_services,
     scheduler_factory: Callable[..., Scheduler] = build_scheduler,
     clock: Callable[[], datetime] | None = None,
+    ocr_engine: OcrEngine | None = None,
 ) -> FastAPI:
     """Create the local Ticket Listing Reviewer application."""
 
@@ -108,6 +112,10 @@ def create_app(
     app = FastAPI(title="Ticket Listing Reviewer", lifespan=lifespan)
     app.state.settings = effective_settings
     app.state.clock = clock or (lambda: datetime.now().astimezone())
+    app.state.ocr_engine = ocr_engine if ocr_engine is not None else TesseractOcrEngine()
+    app.state.manual_csrf_token = secrets.token_urlsafe(32)
+    app.state.manual_confirmation_guard = Lock()
+    app.state.manual_confirmation_locks = {}
     web_root = Path(__file__).resolve().parent / "web"
     app.mount("/static", StaticFiles(directory=str(web_root / "static")), name="static")
     app.include_router(web_router)

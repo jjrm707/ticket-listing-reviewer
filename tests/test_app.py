@@ -100,6 +100,24 @@ def test_health_route_does_not_expose_secrets():
     assert "private-location" not in response.text
 
 
+def test_app_factory_accepts_local_ocr_engine_without_invoking_it():
+    order = []
+    ocr_engine = SimpleNamespace(
+        extract_text=lambda _path: pytest.fail("OCR must not run during construction")
+    )
+
+    app = create_app(
+        Settings(_env_file=None),
+        migration_runner=lambda _url: None,
+        services_factory=lambda _settings: RecordingServices(order),
+        scheduler_factory=lambda scan, _settings, *, clock: RecordingScheduler(scan, order),
+        clock=lambda: NOW,
+        ocr_engine=ocr_engine,
+    )
+
+    assert app.state.ocr_engine is ocr_engine
+
+
 def test_lifespan_orders_migration_services_scheduler_immediate_scan_and_cleanup():
     order = []
     app = injected_app(order)
