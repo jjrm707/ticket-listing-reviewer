@@ -280,7 +280,7 @@ def _live_client(session_factory, settings, alert_service):
         services_factory=lambda _settings: services,
         scheduler_factory=lambda *_args, **_kwargs: PassiveScheduler(),
     )
-    return TestClient(app)
+    return TestClient(app, base_url="http://127.0.0.1")
 
 
 def test_live_notification_route_uses_owned_alert_service_publisher_once(session_factory):
@@ -482,7 +482,7 @@ def test_invalid_settings_roll_back_and_close_the_request_session(settings, sess
         services_factory=lambda _settings: services,
         scheduler_factory=lambda *_args, **_kwargs: PassiveScheduler(),
     )
-    with TestClient(app) as custom_client:
+    with TestClient(app, base_url="http://127.0.0.1") as custom_client:
         response = custom_client.post(
             "/settings",
             data={"budget_cap": "private-invalid-value"},

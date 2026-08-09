@@ -191,23 +191,13 @@ def test_scan_exception_is_contained_without_logging_private_details(settings, c
     assert scheduler.get_job("hourly-market-scan") is job
 
 
-def test_scheduler_restores_its_generic_error_log_after_migration_logging_setup(
-    monkeypatch, settings, caplog
+def test_scheduler_factory_respects_an_embedding_app_that_disabled_its_logger(
+    monkeypatch, settings
 ):
     scheduler_logger = logging.getLogger("ticket_reviewer.services.scheduler")
     monkeypatch.setattr(scheduler_logger, "disabled", True)
-
-    def fail(_now):
-        raise RuntimeError("private connector detail")
-
-    scheduler = build_scheduler(fail, settings, now=NOW, clock=lambda: LATER)
-
-    with caplog.at_level(logging.ERROR):
-        scheduler.get_job("hourly-market-scan").func()
-
-    assert [record.getMessage() for record in caplog.records] == [
-        "scheduled scan failed"
-    ]
+    build_scheduler(lambda _now: None, settings, now=NOW, clock=lambda: LATER)
+    assert scheduler_logger.disabled is True
 
 
 def test_factory_does_not_start_threads_and_repeated_calls_are_isolated(

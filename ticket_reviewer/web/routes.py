@@ -13,7 +13,6 @@ from pathlib import Path
 import re
 import secrets
 import stat
-from threading import Lock
 import unicodedata
 from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 import warnings
@@ -61,6 +60,7 @@ from ticket_reviewer.services.ocr import (
     normalize_ocr_text,
     parse_listing_text,
 )
+from ticket_reviewer.services.keyed_locks import KeyedLockRegistry
 
 from .viewmodels import (
     EventEstimate,
@@ -843,14 +843,9 @@ async def test_notification(request: Request):
     return RedirectResponse(f"/settings?result={code}", status_code=303)
 
 
-def _outcome_lock(request: Request, opportunity_id: int) -> Lock:
-    with request.app.state.outcome_guard:
-        locks = request.app.state.outcome_locks
-        lock = locks.get(opportunity_id)
-        if lock is None:
-            lock = Lock()
-            locks[opportunity_id] = lock
-        return lock
+def _outcome_lock(request: Request, opportunity_id: int):
+    registry: KeyedLockRegistry[int] = request.app.state.outcome_locks
+    return registry.hold(opportunity_id)
 
 
 def _outcome_form_values(row: OutcomeRow | None) -> dict[str, str]:
@@ -1253,15 +1248,9 @@ def _observation(row: ObservationRow, event_external_id: str) -> SourceObservati
     )
 
 
-def _confirmation_lock(request: Request, review_id: int) -> Lock:
-    guard = request.app.state.manual_confirmation_guard
-    with guard:
-        locks = request.app.state.manual_confirmation_locks
-        lock = locks.get(review_id)
-        if lock is None:
-            lock = Lock()
-            locks[review_id] = lock
-        return lock
+def _confirmation_lock(request: Request, review_id: int):
+    registry: KeyedLockRegistry[int] = request.app.state.manual_confirmation_locks
+    return registry.hold(review_id)
 
 
 def _result_context(request: Request, review_id: int, payload: dict, *, repeated: bool):

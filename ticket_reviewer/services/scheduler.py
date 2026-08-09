@@ -69,8 +69,6 @@ def build_scheduler(
     passes_timestamp = _accepts_timestamp(scan_callable)
     effective_clock = clock or (lambda: datetime.now(timezone.utc))
     first_run = _as_utc(now if now is not None else effective_clock())
-    _LOGGER.disabled = False
-
     def run_scan() -> None:
         try:
             current = _as_utc(effective_clock())

@@ -63,7 +63,7 @@ def client(session_factory, settings):
         scheduler_factory=lambda *_args, **_kwargs: PassiveScheduler(),
         clock=lambda: NOW,
     )
-    with TestClient(app) as test_client:
+    with TestClient(app, base_url="http://127.0.0.1") as test_client:
         yield test_client
 
 

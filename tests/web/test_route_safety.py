@@ -52,7 +52,9 @@ def tracking_client(*, raise_server_exceptions=True):
         clock=lambda: NOW,
     )
     return engine, factory, TestClient(
-        app, raise_server_exceptions=raise_server_exceptions
+        app,
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=raise_server_exceptions,
     )
 
 

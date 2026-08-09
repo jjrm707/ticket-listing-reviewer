@@ -4,7 +4,7 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -43,6 +43,15 @@ class Settings(BaseSettings):
     stubhub_client_secret: SecretStr | None = None
     ntfy_topic: SecretStr | None = None
     ntfy_access_token: SecretStr | None = None
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def validate_loopback_host(cls, value: object) -> str:
+        """Keep version-one listener configuration deliberately local."""
+
+        if type(value) is not str or value not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("host must be a canonical loopback address")
+        return value
 
 
 class RuntimeSettings(BaseModel):

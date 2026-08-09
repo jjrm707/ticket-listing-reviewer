@@ -3,6 +3,7 @@ from alembic.autogenerate import compare_metadata
 from alembic.config import Config
 from alembic.migration import MigrationContext
 import pytest
+import logging
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.exc import IntegrityError
 
@@ -119,3 +120,14 @@ def test_migrated_schema_matches_orm_metadata(tmp_path):
             assert compare_metadata(context, Base.metadata) == []
     finally:
         engine.dispose()
+
+
+def test_application_migration_does_not_disable_scheduler_logger(tmp_path, monkeypatch):
+    scheduler_logger = logging.getLogger("ticket_reviewer.services.scheduler")
+    monkeypatch.setattr(scheduler_logger, "disabled", False)
+    config = Config("alembic.ini")
+    config.set_main_option("sqlalchemy.url", f"sqlite:///{tmp_path / 'logging.db'}")
+
+    command.upgrade(config, "head")
+
+    assert scheduler_logger.disabled is False

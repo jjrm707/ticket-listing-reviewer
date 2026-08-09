@@ -13,6 +13,7 @@
     <a class="brand" href="/">Ticket Listing Reviewer</a>
     <nav aria-label="Primary"><a href="/">Opportunities</a><a href="/manual">Manual review</a><a href="/settings">Settings</a><a href="/health">Health</a></nav>
   </header>
+  {% if request.app.state.settings.dry_run %}<aside class="dry-run-banner" role="status"><strong>Dry-run mode:</strong> qualifying alerts are recorded locally without push delivery.</aside>{% endif %}
   <main id="main" tabindex="-1">{% block content %}{% endblock %}</main>
   <footer>Local, read-only decision support. No purchasing or transaction access.</footer>
   {% block scripts %}{% endblock %}

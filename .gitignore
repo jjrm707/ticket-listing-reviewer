@@ -3,8 +3,16 @@
 .venv/
 .python313/
 data/*.db
+data/*.db-*
+data/*.lock
+data/**/*.db
+data/**/*.db-*
+data/**/*.lock
+data/backups/
 data/screenshots/
 logs/
+*.db.lock
+*.log
 __pycache__/
 *.py[cod]
 *.egg-info/
