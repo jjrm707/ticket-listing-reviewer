@@ -22,6 +22,7 @@ from ticket_reviewer.data.schema import (
     EventRow,
     ObservationRow,
     OpportunityRow,
+    OutcomeRow,
     SourceEventRow,
 )
 from ticket_reviewer.domain.enums import (
@@ -147,6 +148,23 @@ class NotificationFailure(RuntimeError):
             if retryable
             else "notification rejected"
         )
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationTestResult:
+    """Nonsecret, fixed-code result for an explicit local notification test."""
+
+    code: str
+
+    def __post_init__(self) -> None:
+        if self.code not in {
+            "dry-run",
+            "sent",
+            "missing-topic",
+            "temporarily-unavailable",
+            "rejected",
+        }:
+            raise ValueError("invalid notification test result")
 
 
 class Publisher(Protocol):
@@ -525,6 +543,12 @@ class _DeliveryFlight:
     decision: AlertDecision | None = None
 
 
+@dataclass(slots=True)
+class _NotificationTestFlight:
+    completed: Event
+    result: NotificationTestResult | None = None
+
+
 class AlertService:
     """Load, decide, publish, and persist using fresh caller-owned sessions."""
 
@@ -541,6 +565,56 @@ class AlertService:
         self._state_lock = Lock()
         self._active_evaluations = 0
         self._delivery_flights: dict[str, _DeliveryFlight] = {}
+        self._active_notification_tests = 0
+        self._notification_test_flight: _NotificationTestFlight | None = None
+
+    def test_notification(self) -> NotificationTestResult:
+        """Publish one static test through the owned publisher without persistence."""
+        with self._state_lock:
+            self._active_notification_tests += 1
+            flight = self._notification_test_flight
+            leader = flight is None
+            if flight is None:
+                flight = _NotificationTestFlight(Event())
+                self._notification_test_flight = flight
+        try:
+            if not leader:
+                flight.completed.wait()
+                with self._state_lock:
+                    shared = flight.result
+                return shared or NotificationTestResult("temporarily-unavailable")
+            result = self._perform_notification_test()
+            with self._state_lock:
+                flight.result = result
+                flight.completed.set()
+            return result
+        finally:
+            with self._state_lock:
+                self._active_notification_tests -= 1
+                if self._active_notification_tests == 0:
+                    self._notification_test_flight = None
+
+    def _perform_notification_test(self) -> NotificationTestResult:
+        if self.settings.dry_run:
+            return NotificationTestResult("dry-run")
+        if self.publisher is None:
+            return NotificationTestResult("missing-topic")
+        message = PushMessage(
+            title="Ticket Reviewer test",
+            body="This is a local Ticket Reviewer test notification.",
+            priority="default",
+            tags=("test_tube",),
+            click_url=None,
+        )
+        try:
+            self.publisher.publish(message)
+        except NotificationFailure as error:
+            return NotificationTestResult(
+                "temporarily-unavailable" if error.retryable else "rejected"
+            )
+        except Exception:
+            return NotificationTestResult("temporarily-unavailable")
+        return NotificationTestResult("sent")
 
     def evaluate_and_send(self, opportunity_id: int, now: datetime) -> AlertDecision:
         if type(opportunity_id) is not int or opportunity_id <= 0 or not _aware_datetime(now):
@@ -691,6 +765,41 @@ class AlertService:
                 if previous_row is not None
                 else None
             )
+            lineage_outcome = session.execute(
+                select(OutcomeRow, OpportunityRow.estimated_net_profit)
+                .join(
+                    OpportunityRow,
+                    OutcomeRow.opportunity_id == OpportunityRow.id,
+                )
+                .join(
+                    ObservationRow,
+                    OpportunityRow.observation_id == ObservationRow.id,
+                )
+                .where(
+                    ObservationRow.source == source.value,
+                    ObservationRow.event_external_id
+                    == observation.event_external_id,
+                    ObservationRow.listing_identity == listing_identity,
+                )
+                .order_by(OutcomeRow.updated_at.desc(), OutcomeRow.id.desc())
+                .limit(1)
+            ).first()
+            authoritative_status = OpportunityStatus(opportunity.status)
+            if lineage_outcome is not None:
+                authoritative_status = OpportunityStatus(lineage_outcome[0].status)
+            if (
+                lineage_outcome is not None
+                and authoritative_status is OpportunityStatus.WATCHING
+                and lineage_outcome[1] is not None
+                and (
+                    previous_row is None
+                    or lineage_outcome[0].updated_at > previous_row.sent_at
+                )
+            ):
+                previous = PreviousAlert(
+                    lineage_outcome[1],
+                    "0" * 64,
+                )
             candidate = AlertCandidate(
                 source=source,
                 event_external_id=observation.event_external_id,
@@ -703,7 +812,7 @@ class AlertService:
                 roi=opportunity.roi,
                 confidence=Confidence(opportunity.confidence),
                 actionable=opportunity.actionable,
-                status=OpportunityStatus(opportunity.status),
+                status=authoritative_status,
                 kind=ObservationKind(observation.kind),
                 currency=observation.currency,
                 pair_price=observation.pair_price,

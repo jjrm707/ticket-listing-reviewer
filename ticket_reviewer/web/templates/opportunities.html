@@ -41,6 +41,8 @@
     </section>
     <p class="timestamps">First seen {{ card.first_seen }} · Last seen {{ card.last_seen }}</p>
     {% if card.source_url %}<p><a href="{{ card.source_url }}" rel="noopener noreferrer">Open public source reference</a></p>{% else %}<p>Public source link unavailable.</p>{% endif %}
+    <h3>Record the real outcome</h3>
+    {% set estimate = card %}{% set outcome = outcomes.get(card.id, {}) %}{% include "outcome_form.html" %}
   </article>
   {% endfor %}
 </section>

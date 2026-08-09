@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 import re
+from collections.abc import Mapping
+import unicodedata
 
 from pydantic import ValidationError
 from sqlalchemy import select
@@ -50,6 +52,19 @@ _VALID_RUNTIME_BASE = {
 }
 _INTEGER_RUNTIME_FIELDS = frozenset(
     {"observation_freshness_minutes", "scan_interval_minutes"}
+)
+_SETTING_MONEY = re.compile(r"(?:0|[1-9]\d{0,9})(?:\.\d{1,2})?")
+_SETTING_RATE = re.compile(r"0(?:\.\d{1,4})?")
+_SETTING_INTEGER = re.compile(r"[1-9]\d{0,3}")
+_MAX_STORED_MONEY = Decimal("9999999999.99")
+_USER_OUTCOME_STATUSES = frozenset(
+    {
+        OpportunityStatus.PASSED,
+        OpportunityStatus.WATCHING,
+        OpportunityStatus.PURCHASED,
+        OpportunityStatus.SOLD,
+        OpportunityStatus.EXPIRED,
+    }
 )
 
 
@@ -257,6 +272,29 @@ class OpportunityRepository:
                     raise ValueError("comparable observation belongs to another event")
                 if comparable.source != scenario.marketplace.value:
                     raise ValueError("comparable observation source does not match scenario")
+        latest_outcome_status = self.session.scalar(
+            select(OutcomeRow.status)
+            .join(
+                OpportunityRow,
+                OutcomeRow.opportunity_id == OpportunityRow.id,
+            )
+            .join(ObservationRow, OpportunityRow.observation_id == ObservationRow.id)
+            .where(
+                ObservationRow.source == candidate.source,
+                ObservationRow.event_external_id == candidate.event_external_id,
+                ObservationRow.listing_identity == candidate.listing_identity,
+            )
+            .order_by(OutcomeRow.updated_at.desc(), OutcomeRow.id.desc())
+            .limit(1)
+        )
+        try:
+            inherited_status = (
+                OpportunityStatus(latest_outcome_status).value
+                if latest_outcome_status is not None
+                else OpportunityStatus.NEW.value
+            )
+        except (TypeError, ValueError):
+            inherited_status = OpportunityStatus.NEW.value
         row = OpportunityRow(
             event_id=event_id,
             observation_id=observation_id,
@@ -270,7 +308,7 @@ class OpportunityRepository:
             confidence=estimate.confidence.value,
             risk_reasons=list(estimate.risk_reasons),
             actionable=estimate.actionable,
-            status=OpportunityStatus.NEW.value,
+            status=inherited_status,
             scenarios=[
                 {
                     "marketplace": scenario.marketplace.value,
@@ -382,24 +420,90 @@ class OutcomeRepository:
         actual_fees: Decimal | None = None,
         notes: str | None = None,
     ) -> int:
-        status_value = OpportunityStatus(status).value
+        if type(opportunity_id) is not int or opportunity_id <= 0:
+            raise ValueError("opportunity ID must be a positive integer")
+        try:
+            status_enum = OpportunityStatus(status)
+        except (TypeError, ValueError):
+            raise ValueError("invalid outcome status") from None
+        if status_enum not in _USER_OUTCOME_STATUSES:
+            raise ValueError("invalid outcome status")
+        acquisition = self._money(actual_acquisition, positive=True)
+        proceeds = self._money(actual_proceeds, positive=True)
+        fees = self._money(actual_fees, positive=False)
+        clean_notes = self._notes(notes)
+        if status_enum is OpportunityStatus.PURCHASED:
+            if acquisition is None or proceeds is not None or fees is not None:
+                raise ValueError("invalid purchased outcome")
+        elif status_enum is OpportunityStatus.SOLD:
+            if proceeds is None or fees is None:
+                raise ValueError("invalid sold outcome")
+        elif any(value is not None for value in (acquisition, proceeds, fees)):
+            raise ValueError("monetary values are not valid for this outcome")
+
         opportunity = self.session.get(OpportunityRow, opportunity_id)
         if opportunity is None:
             raise LookupError(f"opportunity {opportunity_id} does not exist")
+        candidate = self.session.get(ObservationRow, opportunity.observation_id)
+        if candidate is None or candidate.event_id != opportunity.event_id:
+            raise LookupError("opportunity context is unavailable")
         row = self.session.scalar(
             select(OutcomeRow).where(OutcomeRow.opportunity_id == opportunity_id)
         )
+        if status_enum is OpportunityStatus.SOLD and acquisition is None:
+            lineage_acquisition = self.session.scalar(
+                select(OutcomeRow.actual_acquisition)
+                .join(
+                    OpportunityRow,
+                    OutcomeRow.opportunity_id == OpportunityRow.id,
+                )
+                .join(
+                    ObservationRow,
+                    OpportunityRow.observation_id == ObservationRow.id,
+                )
+                .where(
+                    ObservationRow.source == candidate.source,
+                    ObservationRow.event_external_id == candidate.event_external_id,
+                    ObservationRow.listing_identity == candidate.listing_identity,
+                    OutcomeRow.actual_acquisition.is_not(None),
+                )
+                .order_by(OutcomeRow.updated_at.desc(), OutcomeRow.id.desc())
+                .limit(1)
+            )
+            if lineage_acquisition is not None:
+                acquisition = self._money(lineage_acquisition, positive=True)
+        outcome_changed = row is None or (
+            row.status != status_enum.value
+            or row.actual_acquisition != acquisition
+            or row.actual_proceeds != proceeds
+            or row.actual_fees != fees
+            or row.notes != clean_notes
+        )
+        status_changed = opportunity.status != status_enum.value
+        if not outcome_changed and not status_changed:
+            return row.id
+        now = utc_now()
         if row is None:
-            row = OutcomeRow(opportunity_id=opportunity_id, status=status_value)
+            row = OutcomeRow(
+                opportunity_id=opportunity_id,
+                status=status_enum.value,
+                actual_acquisition=acquisition,
+                actual_proceeds=proceeds,
+                actual_fees=fees,
+                notes=clean_notes,
+                updated_at=now,
+            )
             self.session.add(row)
-        row.status = status_value
-        row.actual_acquisition = actual_acquisition
-        row.actual_proceeds = actual_proceeds
-        row.actual_fees = actual_fees
-        row.notes = notes
-        row.updated_at = utc_now()
-        opportunity.status = status_value
-        opportunity.updated_at = utc_now()
+        elif outcome_changed:
+            row.status = status_enum.value
+            row.actual_acquisition = acquisition
+            row.actual_proceeds = proceeds
+            row.actual_fees = fees
+            row.notes = clean_notes
+            row.updated_at = now
+        if status_changed:
+            opportunity.status = status_enum.value
+            opportunity.updated_at = now
         self.session.flush()
         return row.id
 
@@ -407,6 +511,36 @@ class OutcomeRepository:
         return self.session.scalar(
             select(OutcomeRow).where(OutcomeRow.opportunity_id == opportunity_id)
         )
+
+    @staticmethod
+    def _money(value: object, *, positive: bool) -> Decimal | None:
+        if value is None:
+            return None
+        if not isinstance(value, Decimal) or not value.is_finite():
+            raise ValueError("invalid outcome money")
+        exponent = value.as_tuple().exponent
+        if not isinstance(exponent, int) or exponent > 0 or exponent < -2:
+            raise ValueError("invalid outcome money")
+        if (
+            value.is_signed()
+            or value > _MAX_STORED_MONEY
+            or value < 0
+            or (positive and value <= 0)
+        ):
+            raise ValueError("invalid outcome money")
+        return value
+
+    @staticmethod
+    def _notes(value: object) -> str | None:
+        if value is None or value == "":
+            return None
+        if not isinstance(value, str) or len(value) > 2000:
+            raise ValueError("invalid outcome notes")
+        if any(
+            unicodedata.category(character).startswith("C") for character in value
+        ):
+            raise ValueError("invalid outcome notes")
+        return value
 
 
 class RunRepository:
@@ -463,6 +597,18 @@ class SettingRepository:
     def set(self, key: str, value: str | Decimal | int) -> None:
         self._ensure_allowed(key)
         parsed = self._parse(key, value)
+        self._store(key, parsed)
+
+    def set_all(self, values: Mapping[str, object]) -> None:
+        if not isinstance(values, Mapping) or set(values) != ALLOWED_SETTING_FIELDS:
+            raise ValueError("complete runtime settings are required")
+        parsed = {
+            key: self._parse(key, values[key]) for key in sorted(ALLOWED_SETTING_FIELDS)
+        }
+        for key, value in parsed.items():
+            self._store(key, value)
+
+    def _store(self, key: str, parsed: Decimal | int) -> None:
         row = self.session.get(SettingRow, key)
         if row is None:
             row = SettingRow(key=key, value=str(parsed))
@@ -489,18 +635,57 @@ class SettingRepository:
     @staticmethod
     def _parse(key: str, value: str | Decimal | int) -> Decimal | int:
         try:
-            if isinstance(value, bool):
-                raise ValueError
-            candidate = dict(_VALID_RUNTIME_BASE)
             if key in _INTEGER_RUNTIME_FIELDS:
-                if isinstance(value, Decimal) and value != value.to_integral_value():
+                if isinstance(value, bool) or isinstance(value, float):
                     raise ValueError
-                candidate[key] = int(value)
+                if isinstance(value, str):
+                    if _SETTING_INTEGER.fullmatch(value) is None:
+                        raise ValueError
+                    parsed: Decimal | int = int(value)
+                elif type(value) is int:
+                    parsed = value
+                elif isinstance(value, Decimal):
+                    if (
+                        not value.is_finite()
+                        or value.as_tuple().exponent != 0
+                        or value != value.to_integral_value()
+                    ):
+                        raise ValueError
+                    parsed = int(value)
+                else:
+                    raise ValueError
             else:
-                candidate[key] = value
+                if isinstance(value, bool) or isinstance(value, float):
+                    raise ValueError
+                pattern = _SETTING_RATE if key.endswith("seller_fee_rate") else _SETTING_MONEY
+                scale = 4 if key.endswith("seller_fee_rate") else 2
+                if isinstance(value, str):
+                    if pattern.fullmatch(value) is None:
+                        raise ValueError
+                    parsed = Decimal(value)
+                elif type(value) is int:
+                    parsed = Decimal(value)
+                elif isinstance(value, Decimal):
+                    exponent = value.as_tuple().exponent
+                    if (
+                        not value.is_finite()
+                        or value.is_signed()
+                        or not isinstance(exponent, int)
+                        or exponent > 0
+                        or exponent < -scale
+                    ):
+                        raise ValueError
+                    parsed = value
+                else:
+                    raise ValueError
+                if key in {"alert_profit_threshold", "profit_improvement_threshold"}:
+                    if parsed > _MAX_STORED_MONEY:
+                        raise ValueError
+            candidate = dict(_VALID_RUNTIME_BASE)
+            candidate[key] = parsed
             validated = RuntimeSettings.model_validate(candidate)
             return getattr(validated, key)
-        except (ValidationError, ValueError):
+        except (ArithmeticError, ValidationError, ValueError):
             raise ValueError(f"invalid value for {key!r}") from None
 
 

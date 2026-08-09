@@ -15,24 +15,27 @@ import secrets
 import stat
 from threading import Lock
 import unicodedata
-from urllib.parse import unquote, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, unquote, urlsplit, urlunsplit
 import warnings
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import case, func, select
 from sqlalchemy.orm import Session, aliased
 from starlette.datastructures import UploadFile
+from starlette.concurrency import run_in_threadpool
 from starlette.formparsers import MultiPartException, MultiPartParser
 
 from ticket_reviewer.data.repositories import (
     EventRepository,
     ObservationRepository,
     OpportunityRepository,
+    OutcomeRepository,
     SettingRepository,
+    ALLOWED_SETTING_FIELDS,
 )
 from ticket_reviewer.data.schema import (
     ConnectorRunRow,
@@ -40,6 +43,7 @@ from ticket_reviewer.data.schema import (
     ManualReviewRow,
     ObservationRow,
     OpportunityRow,
+    OutcomeRow,
     SourceEventRow,
 )
 from ticket_reviewer.domain.enums import (
@@ -100,6 +104,19 @@ _EVENT_MATCH_THRESHOLD = Decimal("0.85")
 _HOME_VENUES = {
     Team.TEXANS: frozenset({"nrg stadium", "reliant stadium"}),
     Team.AGGIES: frozenset({"kyle field"}),
+}
+_FORM_BODY_LIMIT = 16 * 1024
+_BAD_PERCENT_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")
+_OUTCOME_FORM_FIELDS = frozenset(
+    {"status", "actual_acquisition", "actual_proceeds", "actual_fees", "notes"}
+)
+_SETTINGS_RESULTS = {
+    "updated": "Settings updated",
+    "dry-run": "Dry run - no push sent",
+    "sent": "Test notification sent",
+    "missing-topic": "Notification topic is missing",
+    "temporarily-unavailable": "Notification service is temporarily unavailable",
+    "rejected": "Notification service rejected the test",
 }
 
 
@@ -190,13 +207,17 @@ def dashboard_context(request: Request):
     session = session_factory()
     try:
         settings = request.app.state.settings
+        effective = SettingRepository(session).effective(settings)
         yield DashboardContext(
             session=session,
             timezone=settings.timezone,
-            freshness_minutes=settings.observation_freshness_minutes,
+            freshness_minutes=effective.observation_freshness_minutes,
             dry_run=bool(settings.dry_run),
             now=_now(request),
         )
+    except BaseException:
+        session.rollback()
+        raise
     finally:
         session.close()
 
@@ -207,6 +228,80 @@ def _manual_error(status_code: int = 400) -> HTTPException:
 
 def _contains_control(value: str) -> bool:
     return any(unicodedata.category(character).startswith("C") for character in value)
+
+
+def _fixed_result(request: Request, allowed: dict[str, str]) -> str | None:
+    items = request.query_params.multi_items()
+    if not items:
+        return None
+    if len(items) != 1 or items[0][0] != "result" or items[0][1] not in allowed:
+        raise _manual_error()
+    return allowed[items[0][1]]
+
+
+def _secret_text(value: object, *, strip: bool = True) -> str:
+    getter = getattr(value, "get_secret_value", None)
+    if not callable(getter):
+        return ""
+    secret = getter()
+    if not isinstance(secret, str):
+        return ""
+    return secret.strip() if strip else secret
+
+
+def _configuration_statuses(settings: object) -> tuple[dict[str, object], ...]:
+    stubhub_id = _secret_text(getattr(settings, "stubhub_client_id", None))
+    stubhub_secret = _secret_text(getattr(settings, "stubhub_client_secret", None))
+    return (
+        {
+            "label": "Ticketmaster credential",
+            "configured": bool(_secret_text(getattr(settings, "ticketmaster_api_key", None))),
+        },
+        {
+            "label": "SeatGeek credential",
+            "configured": bool(_secret_text(getattr(settings, "seatgeek_client_id", None))),
+        },
+        {
+            "label": "StubHub credential pair",
+            "configured": bool(stubhub_id and stubhub_secret),
+        },
+        {
+            "label": "Notification topic",
+            "configured": bool(_secret_text(getattr(settings, "ntfy_topic", None), strip=False)),
+        },
+        {
+            "label": "Optional notification access token",
+            "configured": bool(_secret_text(getattr(settings, "ntfy_access_token", None), strip=False)),
+        },
+    )
+
+
+def _exact_names(
+    values: dict[str, list[object]],
+    *,
+    allowed: frozenset[str],
+    required: frozenset[str],
+) -> None:
+    names = set(values)
+    if not required.issubset(names) or not names.issubset(allowed | {"csrf_token"}):
+        raise _manual_error()
+    if any(len(items) != 1 for items in values.values()):
+        raise _manual_error()
+
+
+def _optional_money(values: dict[str, list[object]], name: str) -> Decimal | None:
+    raw = _single_text(values, name, required=False, max_length=32)
+    if not raw:
+        return None
+    if _FORM_MONEY.fullmatch(raw) is None:
+        raise _manual_error(422)
+    try:
+        parsed = Decimal(raw)
+    except (InvalidOperation, ValueError):
+        raise _manual_error(422) from None
+    if not parsed.is_finite():
+        raise _manual_error(422)
+    return parsed
 
 
 def _csrf(request: Request, values: dict[str, list[object]]) -> None:
@@ -235,9 +330,11 @@ async def _form_values(request: Request, *, multipart: bool) -> dict[str, list[o
                 max_part_size=4096,
             ).parse()
         else:
-            form = await request.form(max_files=0, max_fields=32, max_part_size=4096)
+            return await _urlencoded_form_values(request)
     except _OversizeUpload:
         raise _manual_error(413) from None
+    except HTTPException:
+        raise
     except Exception:
         raise _manual_error() from None
     values: dict[str, list[object]] = defaultdict(list)
@@ -249,6 +346,46 @@ async def _form_values(request: Request, *, multipart: bool) -> dict[str, list[o
     except Exception:
         await _close_uploads(value for _name, value in form.multi_items())
         raise
+    return values
+
+
+async def _urlencoded_form_values(request: Request) -> dict[str, list[object]]:
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type != "application/x-www-form-urlencoded":
+        raise _manual_error()
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > _FORM_BODY_LIMIT:
+                raise _manual_error(413)
+        except ValueError:
+            raise _manual_error() from None
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > _FORM_BODY_LIMIT:
+            raise _manual_error(413)
+    if any(value > 127 for value in raw):
+        raise _manual_error()
+    encoded = raw.decode("ascii")
+    if _BAD_PERCENT_ESCAPE.search(encoded) is not None:
+        raise _manual_error()
+    try:
+        pairs = parse_qsl(
+            encoded,
+            keep_blank_values=True,
+            strict_parsing=True,
+            encoding="utf-8",
+            errors="strict",
+            max_num_fields=32,
+        )
+    except (UnicodeError, ValueError):
+        raise _manual_error() from None
+    values: dict[str, list[object]] = defaultdict(list)
+    for name, value in pairs:
+        if not name or len(name) > 80:
+            raise _manual_error()
+        values[name].append(value)
     return values
 
 
@@ -576,6 +713,240 @@ def _purge_stale_reviews(request: Request, now: datetime) -> None:
     finally:
         if session is not None:
             session.close()
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(
+    request: Request, context: DashboardContext = Depends(dashboard_context)
+):
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        _settings_context(
+            request,
+            context.session,
+            result=_fixed_result(request, _SETTINGS_RESULTS),
+        ),
+    )
+
+
+def _settings_context(
+    request: Request,
+    session: Session,
+    *,
+    result: str | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    effective = SettingRepository(session).effective(request.app.state.settings)
+    values = {
+        key: str(getattr(effective, key)) for key in sorted(ALLOWED_SETTING_FIELDS)
+    }
+    return {
+        "csrf_token": request.app.state.manual_csrf_token,
+        "values": values,
+        "configuration_statuses": _configuration_statuses(request.app.state.settings),
+        "result": result,
+        "error": error,
+    }
+
+
+def _settings_error_response(
+    request: Request, session: Session, status_code: int
+):
+    error = {
+        400: "Settings were not saved. Refresh the page and try again.",
+        413: "Settings were not saved because the request was too large.",
+        422: "Settings were not saved. Check each nonsecret value.",
+        503: "Settings could not be saved. Try again later.",
+    }.get(status_code, "Settings could not be saved. Try again later.")
+    return templates.TemplateResponse(
+        request,
+        "settings.html",
+        _settings_context(request, session, error=error),
+        status_code=status_code,
+    )
+
+
+@router.post("/settings")
+async def update_settings(
+    request: Request, context: DashboardContext = Depends(dashboard_context)
+):
+    try:
+        values = await _form_values(request, multipart=False)
+        _csrf(request, values)
+        _exact_names(
+            values,
+            allowed=ALLOWED_SETTING_FIELDS,
+            required=ALLOWED_SETTING_FIELDS,
+        )
+        submitted = {
+            key: _single_text(values, key, max_length=32)
+            for key in ALLOWED_SETTING_FIELDS
+        }
+        SettingRepository(context.session).set_all(submitted)
+        context.session.commit()
+    except HTTPException as error:
+        context.session.rollback()
+        return _settings_error_response(request, context.session, error.status_code)
+    except ValueError:
+        context.session.rollback()
+        return _settings_error_response(request, context.session, 422)
+    except Exception:
+        context.session.rollback()
+        return _settings_error_response(request, context.session, 503)
+    return RedirectResponse("/settings?result=updated", status_code=303)
+
+
+@router.post("/notifications/test")
+async def test_notification(request: Request):
+    try:
+        values = await _form_values(request, multipart=False)
+        _csrf(request, values)
+        _exact_names(values, allowed=frozenset(), required=frozenset())
+    except HTTPException as error:
+        message = (
+            "Notification test was not sent because the request was too large."
+            if error.status_code == 413
+            else "Notification test was not sent. Refresh the page and try again."
+        )
+        services = getattr(request.app.state, "services", None)
+        session_factory = getattr(services, "session_factory", None)
+        if not callable(session_factory):
+            raise
+        with session_factory() as session:
+            session.rollback()
+            return templates.TemplateResponse(
+                request,
+                "settings.html",
+                _settings_context(request, session, error=message),
+                status_code=error.status_code,
+            )
+    settings = request.app.state.settings
+    if settings.dry_run:
+        code = "dry-run"
+    else:
+        services = getattr(request.app.state, "services", None)
+        service = getattr(services, "alert_service", None)
+        method = getattr(service, "test_notification", None)
+        if callable(method):
+            try:
+                result = await run_in_threadpool(method)
+                code = result.code
+            except Exception:
+                code = "temporarily-unavailable"
+        elif _secret_text(settings.ntfy_topic, strip=False):
+            code = "temporarily-unavailable"
+        else:
+            code = "missing-topic"
+    if code not in _SETTINGS_RESULTS:
+        code = "temporarily-unavailable"
+    return RedirectResponse(f"/settings?result={code}", status_code=303)
+
+
+def _outcome_lock(request: Request, opportunity_id: int) -> Lock:
+    with request.app.state.outcome_guard:
+        locks = request.app.state.outcome_locks
+        lock = locks.get(opportunity_id)
+        if lock is None:
+            lock = Lock()
+            locks[opportunity_id] = lock
+        return lock
+
+
+def _outcome_form_values(row: OutcomeRow | None) -> dict[str, str]:
+    if row is None:
+        return {}
+    return {
+        "status": row.status if row.status in {item.value for item in OpportunityStatus} else "",
+        "actual_acquisition": str(row.actual_acquisition)
+        if row.actual_acquisition is not None
+        else "",
+        "actual_proceeds": str(row.actual_proceeds)
+        if row.actual_proceeds is not None
+        else "",
+        "actual_fees": str(row.actual_fees) if row.actual_fees is not None else "",
+        "notes": clean_text(row.notes, maximum=2000, fallback=""),
+    }
+
+
+def _outcome_error_response(
+    request: Request,
+    context: DashboardContext,
+    opportunity: OpportunityRow,
+    status_code: int,
+):
+    error = {
+        400: "Outcome was not saved. Refresh the page and try again.",
+        413: "Outcome was not saved because the request was too large.",
+        422: "Outcome was not saved. Check the fields required for that state.",
+        503: "Outcome could not be saved. Try again later.",
+    }.get(status_code, "Outcome could not be saved. Try again later.")
+    existing = OutcomeRepository(context.session).get(opportunity.id)
+    return templates.TemplateResponse(
+        request,
+        "outcome_error.html",
+        {
+            "estimate": {"id": opportunity.id},
+            "event_id": opportunity.event_id,
+            "outcome": _outcome_form_values(existing),
+            "csrf_token": request.app.state.manual_csrf_token,
+            "error": error,
+        },
+        status_code=status_code,
+    )
+
+
+@router.post("/opportunities/{opportunity_id}/status")
+async def update_outcome(
+    request: Request,
+    opportunity_id: str,
+    context: DashboardContext = Depends(dashboard_context),
+):
+    if _POSITIVE_ID.fullmatch(opportunity_id) is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    numeric_id = int(opportunity_id)
+    opportunity = context.session.get(OpportunityRow, numeric_id)
+    if opportunity is None:
+        raise HTTPException(status_code=404, detail="Opportunity not found")
+    try:
+        values = await _form_values(request, multipart=False)
+        _csrf(request, values)
+        _exact_names(
+            values,
+            allowed=_OUTCOME_FORM_FIELDS,
+            required=frozenset({"status"}),
+        )
+        status = _single_text(values, "status", max_length=16)
+        actual_acquisition = _optional_money(values, "actual_acquisition")
+        actual_proceeds = _optional_money(values, "actual_proceeds")
+        actual_fees = _optional_money(values, "actual_fees")
+        notes = _single_text(values, "notes", required=False, max_length=2000) or None
+    except HTTPException as error:
+        context.session.rollback()
+        return _outcome_error_response(
+            request, context, opportunity, error.status_code
+        )
+    with _outcome_lock(request, numeric_id):
+        event_id = opportunity.event_id
+        try:
+            OutcomeRepository(context.session).save(
+                numeric_id,
+                status,
+                actual_acquisition=actual_acquisition,
+                actual_proceeds=actual_proceeds,
+                actual_fees=actual_fees,
+                notes=notes,
+            )
+            context.session.commit()
+        except ValueError:
+            context.session.rollback()
+            return _outcome_error_response(request, context, opportunity, 422)
+        except Exception:
+            context.session.rollback()
+            return _outcome_error_response(request, context, opportunity, 503)
+    return RedirectResponse(
+        f"/events/{event_id}?result=outcome-updated", status_code=303
+    )
 
 
 @router.get("/manual", response_class=HTMLResponse)
@@ -1155,10 +1526,41 @@ def opportunities(
             )
         except (TypeError, ValueError):
             continue
+    card_ids = [card.id for card in cards]
+    outcome_rows = (
+        list(
+            session.scalars(
+                select(OutcomeRow).where(OutcomeRow.opportunity_id.in_(card_ids))
+            )
+        )
+        if card_ids
+        else []
+    )
+    outcomes = {
+        row.opportunity_id: {
+            "status": row.status,
+            "actual_acquisition": str(row.actual_acquisition)
+            if row.actual_acquisition is not None
+            else "",
+            "actual_proceeds": str(row.actual_proceeds)
+            if row.actual_proceeds is not None
+            else "",
+            "actual_fees": str(row.actual_fees)
+            if row.actual_fees is not None
+            else "",
+            "notes": clean_text(row.notes, maximum=2000, fallback=""),
+        }
+        for row in outcome_rows
+    }
     return templates.TemplateResponse(
         request,
         "opportunities.html",
-        {"cards": cards, "filters": {key: str(value) for key, value in filters.items()}},
+        {
+            "cards": cards,
+            "filters": {key: str(value) for key, value in filters.items()},
+            "outcomes": outcomes,
+            "csrf_token": request.app.state.manual_csrf_token,
+        },
     )
 
 
@@ -1169,6 +1571,7 @@ def event_detail(
     context: DashboardContext = Depends(dashboard_context),
 ):
     session = context.session
+    result = _fixed_result(request, {"outcome-updated": "Outcome updated"})
     if type(event_id) is not int or event_id <= 0:
         raise HTTPException(status_code=404, detail="Event not found")
     event = session.get(EventRow, event_id)
@@ -1248,6 +1651,31 @@ def event_detail(
             estimates.append(EventEstimate.from_row(item))
         except (TypeError, ValueError):
             continue
+    outcome_rows = list(
+        session.scalars(
+            select(OutcomeRow)
+            .join(OpportunityRow, OutcomeRow.opportunity_id == OpportunityRow.id)
+            .where(OpportunityRow.event_id == event_id)
+        )
+    )
+    outcomes = {}
+    for row in outcome_rows:
+        outcomes[row.opportunity_id] = {
+            "status": row.status
+            if row.status in {item.value for item in OpportunityStatus}
+            else "",
+            "actual_acquisition": str(row.actual_acquisition)
+            if isinstance(row.actual_acquisition, Decimal)
+            and row.actual_acquisition.is_finite()
+            else "",
+            "actual_proceeds": str(row.actual_proceeds)
+            if isinstance(row.actual_proceeds, Decimal) and row.actual_proceeds.is_finite()
+            else "",
+            "actual_fees": str(row.actual_fees)
+            if isinstance(row.actual_fees, Decimal) and row.actual_fees.is_finite()
+            else "",
+            "notes": clean_text(row.notes, maximum=2000, fallback=""),
+        }
     history_notices = []
     if observation_total > _MAX_EVENT_OBSERVATIONS:
         history_notices.append(
@@ -1283,6 +1711,9 @@ def event_detail(
             "history_notices": history_notices,
             "chart": {"datasets": datasets},
             "estimates": estimates,
+            "outcomes": outcomes,
+            "csrf_token": request.app.state.manual_csrf_token,
+            "result": result,
         },
     )
 

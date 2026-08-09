@@ -116,6 +116,8 @@ def create_app(
     app.state.manual_csrf_token = secrets.token_urlsafe(32)
     app.state.manual_confirmation_guard = Lock()
     app.state.manual_confirmation_locks = {}
+    app.state.outcome_guard = Lock()
+    app.state.outcome_locks = {}
     web_root = Path(__file__).resolve().parent / "web"
     app.mount("/static", StaticFiles(directory=str(web_root / "static")), name="static")
     app.include_router(web_router)
@@ -146,7 +148,10 @@ def create_app(
     @app.middleware("http")
     async def dashboard_headers(request, call_next):
         response = await call_next(request)
-        if response.headers.get("content-type", "").startswith("text/html"):
+        if (
+            response.headers.get("content-type", "").startswith("text/html")
+            or 300 <= response.status_code < 400
+        ):
             response.headers["Cache-Control"] = "no-store"
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["Referrer-Policy"] = "no-referrer"

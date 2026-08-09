@@ -1,0 +1,18 @@
+<form class="outcome-form" action="/opportunities/{{ estimate.id }}/status" method="post" aria-label="Update outcome for estimate {{ estimate.id }}"{% if error %} aria-describedby="outcome-error outcome-guidance-{{ estimate.id }}"{% else %} aria-describedby="outcome-guidance-{{ estimate.id }}"{% endif %}>
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p id="outcome-guidance-{{ estimate.id }}" class="field-note outcome-guidance">Watching, passed, and expired use notes only. Purchased requires actual acquisition cost. Sold requires proceeds and fees; acquisition cost is optional or preserved from purchased.</p>
+  <label for="status-{{ estimate.id }}">Outcome</label>
+  <select id="status-{{ estimate.id }}" name="status" required>
+    <option value="">Choose an outcome</option>
+    {% for value in ["watching", "passed", "purchased", "sold", "expired"] %}<option value="{{ value }}"{% if outcome.status == value %} selected{% endif %}>{{ value|title }}</option>{% endfor %}
+  </select>
+  <label for="actual-acquisition-{{ estimate.id }}">Actual acquisition cost</label>
+  <input id="actual-acquisition-{{ estimate.id }}" name="actual_acquisition" inputmode="decimal" value="{{ outcome.actual_acquisition|default('') }}">
+  <label for="actual-proceeds-{{ estimate.id }}">Actual sale proceeds</label>
+  <input id="actual-proceeds-{{ estimate.id }}" name="actual_proceeds" inputmode="decimal" value="{{ outcome.actual_proceeds|default('') }}">
+  <label for="actual-fees-{{ estimate.id }}">Actual sale fees</label>
+  <input id="actual-fees-{{ estimate.id }}" name="actual_fees" inputmode="decimal" value="{{ outcome.actual_fees|default('') }}">
+  <label for="notes-{{ estimate.id }}">Notes</label>
+  <textarea id="notes-{{ estimate.id }}" name="notes" maxlength="2000">{{ outcome.notes|default('') }}</textarea>
+  <button type="submit">Save outcome</button>
+</form>

@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Settings · Ticket Listing Reviewer{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">Nonsecret runtime assumptions</p>
+  <h1>Settings</h1>
+  <p>These local values affect the next scan. Credentials and notification secrets remain environment-only.</p>
+  {% if result %}<p class="notice" role="status">{{ result }}</p>{% endif %}
+  {% if error %}<p id="settings-error" class="form-error" role="alert">{{ error }}</p>{% endif %}
+</section>
+<section aria-labelledby="runtime-settings-heading">
+  <h2 id="runtime-settings-heading">Review assumptions</h2>
+  <form class="settings-form" action="/settings" method="post"{% if error %} aria-describedby="settings-error"{% endif %}>
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="settings-field"><label for="budget_cap">Pair budget cap</label><input id="budget_cap" name="budget_cap" inputmode="decimal" required value="{{ values.budget_cap }}" aria-describedby="budget_cap_note"><p id="budget_cap_note" class="field-note">$1.00 through $400.00, entered to cents.</p></div>
+    <div class="settings-field"><label for="alert_profit_threshold">Alert profit threshold</label><input id="alert_profit_threshold" name="alert_profit_threshold" inputmode="decimal" required value="{{ values.alert_profit_threshold }}" aria-describedby="alert_profit_note"><p id="alert_profit_note" class="field-note">Minimum estimated net profit for a new alert.</p></div>
+    <div class="settings-field"><label for="profit_improvement_threshold">Repeat profit improvement</label><input id="profit_improvement_threshold" name="profit_improvement_threshold" inputmode="decimal" required value="{{ values.profit_improvement_threshold }}" aria-describedby="improvement_note"><p id="improvement_note" class="field-note">Required improvement before another watching alert.</p></div>
+    <div class="settings-field"><label for="observation_freshness_minutes">Observation freshness (minutes)</label><input id="observation_freshness_minutes" name="observation_freshness_minutes" inputmode="numeric" required value="{{ values.observation_freshness_minutes }}"><p class="field-note">60 through 1,440 minutes.</p></div>
+    <div class="settings-field"><label for="scan_interval_minutes">Scan interval (minutes)</label><input id="scan_interval_minutes" name="scan_interval_minutes" inputmode="numeric" required readonly value="{{ values.scan_interval_minutes }}" aria-describedby="scan_note"><p id="scan_note" class="field-note">Fixed at 60 minutes in version one.</p></div>
+    <fieldset>
+      <legend>Seller fee user assumptions</legend>
+      <p class="field-note">These are your planning assumptions, not marketplace guarantees.</p>
+      <div class="settings-field"><label for="stubhub_seller_fee_rate">StubHub seller fee rate</label><input id="stubhub_seller_fee_rate" name="stubhub_seller_fee_rate" inputmode="decimal" required value="{{ values.stubhub_seller_fee_rate }}"></div>
+      <div class="settings-field"><label for="ticketmaster_seller_fee_rate">Ticketmaster seller fee rate</label><input id="ticketmaster_seller_fee_rate" name="ticketmaster_seller_fee_rate" inputmode="decimal" required value="{{ values.ticketmaster_seller_fee_rate }}"></div>
+      <div class="settings-field"><label for="seatgeek_seller_fee_rate">SeatGeek seller fee rate</label><input id="seatgeek_seller_fee_rate" name="seatgeek_seller_fee_rate" inputmode="decimal" required value="{{ values.seatgeek_seller_fee_rate }}"></div>
+    </fieldset>
+    <button type="submit">Save nonsecret settings</button>
+  </form>
+</section>
+<section aria-labelledby="credential-status-heading">
+  <h2 id="credential-status-heading">Environment configuration status</h2>
+  <dl class="status-list">
+    {% for item in configuration_statuses %}<div><dt>{{ item.label }}</dt><dd>{{ "Configured" if item.configured else "Missing" }}</dd></div>{% endfor %}
+  </dl>
+</section>
+<section aria-labelledby="notification-test-heading">
+  <h2 id="notification-test-heading">Notification test</h2>
+  <p>Sends only a static test message through the configured production publisher. It never records opportunity alert history.</p>
+  <form class="compact-form" action="/notifications/test" method="post">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <button type="submit">Test notification</button>
+  </form>
+</section>
+{% endblock %}
