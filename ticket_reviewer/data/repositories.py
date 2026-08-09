@@ -231,6 +231,32 @@ class OpportunityRepository:
     def save_estimate(
         self, event_id: int, observation_id: int, estimate: OpportunityEstimate
     ) -> int:
+        if type(event_id) is not int or event_id <= 0:
+            raise ValueError("event ID must be a positive integer")
+        if type(observation_id) is not int or observation_id <= 0:
+            raise ValueError("candidate observation ID must be a positive integer")
+        candidate = self.session.get(ObservationRow, observation_id)
+        if candidate is None:
+            raise ValueError("candidate observation does not exist")
+        if candidate.event_id != event_id:
+            raise ValueError("candidate observation belongs to another event")
+        for scenario in estimate.scenarios:
+            if len(scenario.comparable_observation_ids) != scenario.comparable_count:
+                raise ValueError(
+                    "new estimates require exact comparable observation IDs"
+                )
+            for comparable_id in scenario.comparable_observation_ids:
+                if type(comparable_id) is not int or comparable_id <= 0:
+                    raise ValueError("comparable observation IDs must be positive integers")
+                if comparable_id == observation_id:
+                    raise ValueError("candidate observation cannot be its own comparable")
+                comparable = self.session.get(ObservationRow, comparable_id)
+                if comparable is None:
+                    raise ValueError("comparable observation does not exist")
+                if comparable.event_id != event_id:
+                    raise ValueError("comparable observation belongs to another event")
+                if comparable.source != scenario.marketplace.value:
+                    raise ValueError("comparable observation source does not match scenario")
         row = OpportunityRow(
             event_id=event_id,
             observation_id=observation_id,
@@ -252,6 +278,9 @@ class OpportunityRepository:
                     "seller_fee_rate": str(scenario.seller_fee_rate),
                     "projected_proceeds": str(scenario.projected_proceeds),
                     "comparable_count": scenario.comparable_count,
+                    "comparable_observation_ids": list(
+                        scenario.comparable_observation_ids
+                    ),
                 }
                 for scenario in estimate.scenarios
             ],

@@ -19,6 +19,7 @@ from ticket_reviewer.data.repositories import (
 )
 from ticket_reviewer.data.schema import Base, SettingRow
 from ticket_reviewer.domain.enums import OpportunityStatus, Source
+from ticket_reviewer.domain.models import ExitScenario
 
 
 @pytest.fixture
@@ -200,9 +201,142 @@ def test_opportunity_serializes_decimal_scenarios_losslessly(
             "projected_resale_gross": "300.00",
             "seller_fee_rate": "0.15",
             "projected_proceeds": "255.00",
-            "comparable_count": 3,
+            "comparable_count": 0,
+            "comparable_observation_ids": [],
         }
     ]
+
+
+def _estimate_with_comparable_ids(*ids, source=Source.STUBHUB):
+    scenario = ExitScenario(
+        marketplace=source,
+        projected_resale_gross=Decimal("300.00"),
+        seller_fee_rate=Decimal("0.15"),
+        projected_proceeds=Decimal("255.00"),
+        comparable_count=len(ids),
+        comparable_observation_ids=tuple(ids),
+    )
+    return replace(make_estimate(), scenarios=(scenario,))
+
+
+def test_opportunity_repository_accepts_only_exact_same_event_source_comparables(
+    session, sample_event, sample_observation
+):
+    event_id = EventRepository(session).upsert(sample_event)
+    candidate_id = ObservationRepository(session).add(event_id, sample_observation)
+    first_id = ObservationRepository(session).add(
+        event_id, replace(sample_observation, listing_id="first")
+    )
+    second_id = ObservationRepository(session).add(
+        event_id, replace(sample_observation, listing_id="second")
+    )
+
+    opportunity_id = OpportunityRepository(session).save_estimate(
+        event_id,
+        candidate_id,
+        _estimate_with_comparable_ids(first_id, second_id),
+    )
+
+    assert OpportunityRepository(session).get(opportunity_id).scenarios[0][
+        "comparable_observation_ids"
+    ] == [first_id, second_id]
+
+
+@pytest.mark.parametrize("invalid_id", [True, 0, -1])
+def test_exit_scenario_rejects_non_positive_or_bool_comparable_ids(invalid_id):
+    with pytest.raises(ValueError, match="positive ints"):
+        _estimate_with_comparable_ids(invalid_id)
+
+
+def test_opportunity_repository_rejects_candidate_as_comparable(
+    session, sample_event, sample_observation
+):
+    event_id = EventRepository(session).upsert(sample_event)
+    candidate_id = ObservationRepository(session).add(event_id, sample_observation)
+
+    with pytest.raises(ValueError, match="own comparable"):
+        OpportunityRepository(session).save_estimate(
+            event_id, candidate_id, _estimate_with_comparable_ids(candidate_id)
+        )
+
+
+def test_opportunity_repository_rejects_missing_foreign_or_wrong_source_ids(
+    session, sample_event, sample_observation
+):
+    event_id = EventRepository(session).upsert(sample_event)
+    candidate_id = ObservationRepository(session).add(event_id, sample_observation)
+    wrong_source_id = ObservationRepository(session).add(
+        event_id,
+        replace(
+            sample_observation,
+            source=Source.SEATGEEK,
+            listing_id="wrong-source",
+        ),
+    )
+    other_event_id = EventRepository(session).upsert(
+        replace(sample_event, external_id="other-event", opponent="Other")
+    )
+    foreign_id = ObservationRepository(session).add(
+        other_event_id, replace(sample_observation, listing_id="foreign")
+    )
+
+    for invalid_id, message in (
+        (999999, "does not exist"),
+        (wrong_source_id, "source does not match"),
+        (foreign_id, "another event"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            OpportunityRepository(session).save_estimate(
+                event_id,
+                candidate_id,
+                _estimate_with_comparable_ids(invalid_id),
+            )
+
+
+def test_opportunity_repository_requires_exact_ids_for_each_new_scenario(
+    session, sample_event, sample_observation
+):
+    event_id = EventRepository(session).upsert(sample_event)
+    candidate_id = ObservationRepository(session).add(event_id, sample_observation)
+    scenario = replace(
+        make_estimate().scenarios[0],
+        comparable_count=1,
+        comparable_observation_ids=(),
+    )
+
+    with pytest.raises(ValueError, match="exact comparable observation IDs"):
+        OpportunityRepository(session).save_estimate(
+            event_id,
+            candidate_id,
+            replace(make_estimate(), scenarios=(scenario,)),
+        )
+
+
+@pytest.mark.parametrize("candidate_id", [True, 0, -1, 999999])
+def test_opportunity_repository_rejects_invalid_or_missing_candidate_ids(
+    session, sample_event, candidate_id
+):
+    event_id = EventRepository(session).upsert(sample_event)
+
+    with pytest.raises(ValueError, match="candidate observation"):
+        OpportunityRepository(session).save_estimate(
+            event_id, candidate_id, replace(make_estimate(), scenarios=())
+        )
+
+
+def test_opportunity_repository_rejects_candidate_from_another_event(
+    session, sample_event, sample_observation
+):
+    event_id = EventRepository(session).upsert(sample_event)
+    other_event_id = EventRepository(session).upsert(
+        replace(sample_event, external_id="other-candidate-event", opponent="Other")
+    )
+    candidate_id = ObservationRepository(session).add(other_event_id, sample_observation)
+
+    with pytest.raises(ValueError, match="candidate observation belongs to another event"):
+        OpportunityRepository(session).save_estimate(
+            event_id, candidate_id, replace(make_estimate(), scenarios=())
+        )
 
 
 def test_setting_overrides_merge_over_base_nonsecret_defaults(session):

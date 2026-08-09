@@ -123,6 +123,19 @@ def test_select_comparables_filters_unusable_evidence_and_normalizes_cents():
     assert selected[0].quality == Decimal("1.00")
 
 
+def test_select_comparables_retains_exact_persisted_observation_identity():
+    candidate = observation(listing_id="candidate", observation_id=41)
+    accepted = observation(
+        source=Source.SEATGEEK,
+        listing_id="accepted",
+        observation_id=73,
+    )
+
+    selected = select_comparables(candidate, (candidate, accepted), now=NOW)
+
+    assert tuple(item.observation_id for item in selected) == (73,)
+
+
 def test_event_level_evidence_has_lower_quality_than_listings():
     candidate = observation(listing_id="candidate")
     selected = select_comparables(

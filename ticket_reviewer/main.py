@@ -8,12 +8,17 @@ from typing import Any, Protocol
 
 from alembic import command
 from alembic.config import Config
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.engine import make_url
 
 from ticket_reviewer.bootstrap import ApplicationServices, build_services
 from ticket_reviewer.config import Settings
 from ticket_reviewer.services.scheduler import build_scheduler
+from ticket_reviewer.web import router as web_router
+from ticket_reviewer.web.routes import templates as web_templates
 
 
 class Scheduler(Protocol):
@@ -102,6 +107,49 @@ def create_app(
 
     app = FastAPI(title="Ticket Listing Reviewer", lifespan=lifespan)
     app.state.settings = effective_settings
+    app.state.clock = clock or (lambda: datetime.now().astimezone())
+    web_root = Path(__file__).resolve().parent / "web"
+    app.mount("/static", StaticFiles(directory=str(web_root / "static")), name="static")
+    app.include_router(web_router)
+
+    @app.exception_handler(HTTPException)
+    async def safe_http_error(request: Request, error: HTTPException):
+        if request.url.path == "/healthz":
+            return JSONResponse({"detail": "Request failed"}, status_code=error.status_code)
+        message = "Event not found" if error.status_code == 404 else "Invalid dashboard request"
+        return web_templates.TemplateResponse(
+            request,
+            "error.html",
+            {"status_code": error.status_code, "message": message},
+            status_code=error.status_code,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def safe_validation_error(request: Request, _error: RequestValidationError):
+        if request.url.path == "/healthz":
+            return JSONResponse({"detail": "Invalid request"}, status_code=422)
+        return web_templates.TemplateResponse(
+            request,
+            "error.html",
+            {"status_code": 422, "message": "Invalid dashboard request"},
+            status_code=422,
+        )
+
+    @app.middleware("http")
+    async def dashboard_headers(request, call_next):
+        response = await call_next(request)
+        if response.headers.get("content-type", "").startswith("text/html"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
+            response.headers["Referrer-Policy"] = "no-referrer"
+            response.headers["X-Frame-Options"] = "DENY"
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
+                "form-action 'self'; object-src 'none'; img-src 'self' data:; "
+                "style-src 'self'; script-src 'self' https://cdn.jsdelivr.net; "
+                "connect-src 'none'"
+            )
+        return response
 
     @app.get("/healthz")
     def healthz() -> dict[str, str | bool]:

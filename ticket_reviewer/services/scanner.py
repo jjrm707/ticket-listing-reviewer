@@ -115,6 +115,7 @@ def _observation_from_row(row, canonical_external_id: str) -> SourceObservation:
         listing_url=row.listing_url,
         listing_count=row.listing_count,
         popularity=row.popularity,
+        observation_id=row.id,
     )
 
 

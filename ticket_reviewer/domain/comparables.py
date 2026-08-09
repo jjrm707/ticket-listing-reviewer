@@ -121,6 +121,7 @@ def select_comparables(
                 observed_at=observation.observed_at,
                 relevance=comparable_weight(candidate, observation),
                 quality=_QUALITY[observation.kind],
+                observation_id=observation.observation_id,
             )
         )
 

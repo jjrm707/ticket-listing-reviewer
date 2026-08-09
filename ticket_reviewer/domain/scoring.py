@@ -58,6 +58,13 @@ def _build_scenarios(
                 seller_fee_rate=fee_rate,
                 projected_proceeds=projected_proceeds(gross, fee_rate),
                 comparable_count=len(grouped[marketplace]),
+                comparable_observation_ids=tuple(
+                    sorted(
+                        item.observation_id
+                        for item in grouped[marketplace]
+                        if item.observation_id is not None
+                    )
+                ),
             )
         )
     return tuple(sorted(scenarios, key=_scenario_sort_key))
@@ -163,6 +170,7 @@ def _adjust_scenarios(
                 seller_fee_rate=scenario.seller_fee_rate,
                 projected_proceeds=projected_proceeds(gross, scenario.seller_fee_rate),
                 comparable_count=scenario.comparable_count,
+                comparable_observation_ids=scenario.comparable_observation_ids,
             )
         )
     return tuple(sorted(adjusted, key=_scenario_sort_key))

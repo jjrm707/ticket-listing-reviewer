@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Event detail · Ticket Listing Reviewer{% endblock %}
+{% block head %}<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>{% endblock %}
+{% block content %}
+<section class="hero"><p class="eyebrow">Event evidence</p><h1>{{ event.team }} vs {{ event.opponent }}</h1><p>{{ event.venue }} · {{ event.kickoff }}</p></section>
+<section><h2>Source event references</h2>{% if source_events %}<ul>{% for item in source_events %}<li>{{ item.source }} · {{ item.external_id }}{% if item.url %} · <a href="{{ item.url }}" rel="noopener noreferrer">Public event reference</a>{% endif %}</li>{% endfor %}</ul>{% else %}<p>No source references recorded.</p>{% endif %}</section>
+{% for notice in history_notices %}<p class="notice">{{ notice }}</p>{% endfor %}
+<section><h2>Price history</h2><p>Listing observations, event floors, and event aggregates are separate evidence types. Event-level signals do not confirm a buyable pair.</p>
+  <div class="chart-wrap"><canvas id="price-chart" aria-label="Price history by source and conservative seating group" role="img"></canvas></div><p class="chart-note">At narrow widths, use the complete table below for source and evidence labels.</p>
+  <script id="chart-data" type="application/json">{{ chart|tojson }}</script>
+  <div class="table-wrap"><table><caption>Price history table</caption><thead><tr><th scope="col">Observation</th><th scope="col">Source</th><th scope="col">Evidence</th><th scope="col">Seat group</th><th scope="col">Observed</th><th scope="col">Pair-basis price</th></tr></thead><tbody>
+  {% for item in history %}<tr><th scope="row">#{{ item.id }}</th><td>{{ item.source }}</td><td>{{ item.kind }}</td><td>{{ item.seat }}</td><td>{{ item.observed }}</td><td>{{ item.price }}</td></tr>{% endfor %}
+  </tbody></table></div>
+</section>
+<section><h2>Estimate explainability</h2>{% if estimates %}{% for estimate in estimates %}<article><h3>Estimate #{{ estimate.id }} · {{ estimate.estimated_net_profit }}</h3><dl><div><dt>Acquisition total</dt><dd>{{ estimate.acquisition_total }}</dd></div><div><dt>Projected resale gross</dt><dd>{{ estimate.projected_resale_gross }}</dd></div><div><dt>Exit marketplace</dt><dd>{{ estimate.exit_source }}</dd></div><div><dt>Seller fee rate</dt><dd>{{ estimate.seller_fee_rate }}</dd></div><div><dt>Seller fee amount</dt><dd>{{ estimate.seller_fee_amount }}</dd></div><div><dt>Projected proceeds</dt><dd>{{ estimate.projected_proceeds }}</dd></div><div><dt>ROI</dt><dd>{{ estimate.roi }}</dd></div><div><dt>Confidence</dt><dd>{{ estimate.confidence_label }}</dd></div></dl><h4>Risk and scoring adjustments</h4><ul>{% for reason in estimate.risk_reasons %}<li>{{ reason }}</li>{% endfor %}</ul><h4>Exact comparable provenance</h4><ul>{% for line in estimate.comparables %}<li>{{ line }}</li>{% endfor %}</ul></article>{% endfor %}{% else %}<p>No estimates recorded for this event.</p>{% endif %}</section>
+{% endblock %}
+{% block scripts %}<script defer src="{{ url_for('static', path='/chart.js') }}?v=12b"></script>{% endblock %}

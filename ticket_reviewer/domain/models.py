@@ -68,6 +68,7 @@ class SourceObservation:
     listing_url: str | None
     listing_count: int | None = None
     popularity: Decimal | None = None
+    observation_id: int | None = None
 
     def __post_init__(self) -> None:
         _require_timezone_aware(self.observed_at, "observed_at")
@@ -82,6 +83,10 @@ class SourceObservation:
         _require_non_negative_int(self.quantity_available, "quantity_available")
         _require_non_negative_int(self.listing_count, "listing_count")
         _require_non_negative(self.popularity, "popularity")
+        if self.observation_id is not None and (
+            type(self.observation_id) is not int or self.observation_id <= 0
+        ):
+            raise ValueError("observation_id must be a positive int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +103,7 @@ class Comparable:
     observed_at: datetime
     relevance: Decimal
     quality: Decimal
+    observation_id: int | None = None
 
     def __post_init__(self) -> None:
         _require_timezone_aware(self.observed_at, "observed_at")
@@ -110,6 +116,10 @@ class Comparable:
         _require_non_negative(self.proceeds_basis, "proceeds_basis")
         _require_non_negative(self.relevance, "relevance")
         _require_non_negative(self.quality, "quality")
+        if self.observation_id is not None and (
+            type(self.observation_id) is not int or self.observation_id <= 0
+        ):
+            raise ValueError("observation_id must be a positive int")
 
 
 @dataclass(frozen=True, slots=True)
@@ -119,6 +129,7 @@ class ExitScenario:
     seller_fee_rate: Decimal
     projected_proceeds: Decimal
     comparable_count: int
+    comparable_observation_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         _require_decimal(self.projected_resale_gross, "projected_resale_gross")
@@ -128,6 +139,19 @@ class ExitScenario:
         _require_rate(self.seller_fee_rate, "seller_fee_rate")
         _require_non_negative(self.projected_proceeds, "projected_proceeds")
         _require_non_negative_int(self.comparable_count, "comparable_count")
+        if not isinstance(self.comparable_observation_ids, tuple) or any(
+            type(value) is not int or value <= 0
+            for value in self.comparable_observation_ids
+        ):
+            raise ValueError("comparable_observation_ids must be positive ints")
+        if tuple(sorted(set(self.comparable_observation_ids))) != (
+            self.comparable_observation_ids
+        ):
+            raise ValueError("comparable_observation_ids must be sorted and unique")
+        if self.comparable_observation_ids and (
+            len(self.comparable_observation_ids) != self.comparable_count
+        ):
+            raise ValueError("comparable IDs must match comparable_count")
 
 
 @dataclass(frozen=True, slots=True)

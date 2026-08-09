@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}Opportunities · Ticket Listing Reviewer{% endblock %}
+{% block content %}
+<section class="hero" aria-labelledby="page-title">
+  <p class="eyebrow">Local opportunity desk</p>
+  <h1 id="page-title">Explainable opportunities</h1>
+  <p>Ranked by finite estimated net profit. Every card exposes its assumptions and risks.</p>
+</section>
+<form class="filters" method="get" action="/" aria-label="Opportunity filters">
+  <label>Team<select name="team"><option value="">All teams</option>{% for value, label in [('texans','Houston Texans'),('aggies','Texas A&M Aggies')] %}<option value="{{ value }}"{% if filters.team == value %} selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+  <label>Event ID<input name="event_id" inputmode="numeric" value="{{ filters.event_id|default('') }}"></label>
+  <label>Candidate source<select name="source"><option value="">All sources</option>{% for value in ['stubhub','ticketmaster','seatgeek','tickpick','manual'] %}<option value="{{ value }}"{% if filters.source == value %} selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
+  <label>Confidence<select name="confidence"><option value="">All levels</option>{% for value in ['high','medium','low'] %}<option value="{{ value }}"{% if filters.confidence == value %} selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
+  <label>Minimum profit<input name="min_profit" value="{{ filters.min_profit|default('') }}" inputmode="decimal"></label>
+  <label>Maximum pair cost<input name="max_cost" value="{{ filters.max_cost|default('') }}" inputmode="decimal"></label>
+  <label>Status<select name="status"><option value="">All statuses</option>{% for value in ['new','watching','passed','purchased','sold','expired'] %}<option value="{{ value }}"{% if filters.status == value %} selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
+  <button type="submit">Apply filters</button>
+</form>
+{% if cards %}
+<section class="card-grid" aria-label="Ranked ticket opportunities">
+  {% for card in cards %}
+  <article class="opportunity-card confidence-{{ card.confidence }}">
+    <header>
+      <p class="eyebrow">{{ card.team }} · {{ card.candidate_source }}</p>
+      <h2><a href="/events/{{ card.event_id }}">vs {{ card.opponent }}</a></h2>
+      <p>{{ card.venue }} · <time>{{ card.kickoff }}</time></p>
+      <div class="badges"><span>{{ card.confidence_label }}</span><span>{{ card.status }}</span><span>{{ card.freshness }}</span></div>
+    </header>
+    <dl class="metrics">
+      <div><dt>Estimated net profit</dt><dd class="profit">{{ card.estimated_net_profit }}</dd></div>
+      <div><dt>ROI</dt><dd>{{ card.roi }}</dd></div>
+      <div><dt>All-in pair cost</dt><dd>{{ card.acquisition_total }}</dd></div>
+      <div><dt>Projected resale gross</dt><dd>{{ card.projected_resale_gross }}</dd></div>
+      <div><dt>Exit marketplace</dt><dd>{{ card.exit_source }}</dd></div>
+      <div><dt>Seller fee</dt><dd>{{ card.seller_fee_rate }} · {{ card.seller_fee_amount }}</dd></div>
+      <div><dt>Projected proceeds</dt><dd>{{ card.projected_proceeds }}</dd></div>
+      <div><dt>Seats</dt><dd>Section {{ card.section }}, row {{ card.row }}, quantity {{ card.quantity }}</dd></div>
+    </dl>
+    <section aria-labelledby="risks-{{ card.id }}"><h3 id="risks-{{ card.id }}">Risk reasons</h3>
+      {% if card.risk_reasons %}<ul>{% for reason in card.risk_reasons %}<li>{{ reason }}</li>{% endfor %}</ul>{% else %}<p>No additional risk reasons recorded.</p>{% endif %}
+    </section>
+    <p class="timestamps">First seen {{ card.first_seen }} · Last seen {{ card.last_seen }}</p>
+    {% if card.source_url %}<p><a href="{{ card.source_url }}" rel="noopener noreferrer">Open public source reference</a></p>{% else %}<p>Public source link unavailable.</p>{% endif %}
+  </article>
+  {% endfor %}
+</section>
+{% else %}<section class="empty"><h2>No opportunities yet</h2><p>Run a configured source scan to build local history.</p></section>{% endif %}
+{% endblock %}
+{% block scripts %}<script defer src="{{ url_for('static', path='/filters.js') }}"></script>{% endblock %}

@@ -17,6 +17,40 @@ FEES = {
 }
 
 
+def test_exit_scenario_records_sorted_unique_exact_comparable_ids():
+    candidate = make_observation(
+        event_external_id="event-1",
+        listing_id="candidate",
+        observation_id=9,
+        observed_at=NOW,
+    )
+    comparables = (
+        make_observation(
+            event_external_id="event-1",
+            listing_id="first",
+            observation_id=8,
+            source=Source.STUBHUB,
+            observed_at=NOW,
+        ),
+        make_observation(
+            event_external_id="event-1",
+            listing_id="second",
+            observation_id=3,
+            source=Source.STUBHUB,
+            observed_at=NOW,
+        ),
+    )
+
+    scenarios = estimate_exit_scenarios(
+        candidate,
+        (candidate, *comparables),
+        {Source.STUBHUB: Decimal("0.15")},
+        now=NOW,
+    )
+
+    assert scenarios[0].comparable_observation_ids == (3, 8)
+
+
 @pytest.fixture
 def now():
     return NOW

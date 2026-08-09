@@ -55,7 +55,7 @@ def make_estimate(**overrides: object) -> OpportunityEstimate:
         projected_resale_gross=Decimal("300.00"),
         seller_fee_rate=Decimal("0.15"),
         projected_proceeds=Decimal("255.00"),
-        comparable_count=3,
+        comparable_count=0,
     )
     estimate = OpportunityEstimate(
         acquisition_total=Decimal("263.15"),

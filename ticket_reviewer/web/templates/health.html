@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+{% block title %}Source health · Ticket Listing Reviewer{% endblock %}
+{% block content %}
+<section class="hero"><p class="eyebrow">Nonsecret operational state</p><h1>Source health</h1><p>{% if dry_run %}<strong>Dry-run notification mode is on.</strong> Alerts are evaluated without delivery.{% else %}Notification delivery mode is enabled.{% endif %}</p></section>
+<section><h2>Latest connector runs</h2><div class="health-grid">{% for item in sources %}<article class="health-card"><h3>{{ item.source }}</h3><p class="status-text">{{ item.state }}</p><dl><div><dt>Started</dt><dd>{{ item.started }}</dd></div><div><dt>Finished</dt><dd>{{ item.finished }}</dd></div><div><dt>Observations</dt><dd>{{ item.count }}</dd></div>{% if item.freshness %}<div><dt>Freshness</dt><dd>{{ item.freshness }}</dd></div>{% endif %}</dl>{% if item.error %}<p class="error-copy">{{ item.error }}</p>{% endif %}</article>{% endfor %}</div></section>
+<section><h2>Data access limitations</h2><p>Ticketmaster, SeatGeek, and StubHub event-only signals cannot alone confirm a buyable pair. The dashboard never claims purchase, reserve, list, sell, or transfer access.</p></section>
+{% endblock %}

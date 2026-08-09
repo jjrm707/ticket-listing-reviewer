@@ -466,6 +466,42 @@ def test_same_canonical_event_comparables_can_score_across_sources(settings, dat
         assert len(session.scalars(select(EventRow)).all()) == 1
 
 
+def test_scanner_persists_exact_comparable_ids_without_candidate(settings, database):
+    event = one_event()
+    candidate = one_observation(
+        listing_id="candidate",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    comparisons = [
+        comparable_observation(
+            pair_price=Decimal("300"), observed_at=NOW - timedelta(seconds=index + 1)
+        )
+        for index in range(3)
+    ]
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {event.external_id: [candidate, *comparisons]},
+    )
+
+    coordinator(settings, database, (connector,)).run(NOW)
+
+    with database() as session:
+        opportunity = session.scalars(select(OpportunityRow)).one()
+        candidate_row = session.get(ObservationRow, opportunity.observation_id)
+        recorded = opportunity.scenarios[0]["comparable_observation_ids"]
+        comparable_rows = session.scalars(
+            select(ObservationRow).where(ObservationRow.id.in_(recorded))
+        ).all()
+        assert recorded == sorted(set(recorded))
+        assert candidate_row.id not in recorded
+        assert len(recorded) == 3
+        assert {row.source for row in comparable_rows} == {"stubhub"}
+        assert {row.event_id for row in comparable_rows} == {opportunity.event_id}
+
+
 def test_ambiguous_event_matches_are_not_merged(settings, database):
     early = one_event(
         source=Source.STUBHUB,
