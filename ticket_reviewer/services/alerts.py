@@ -9,6 +9,7 @@ import logging
 import math
 import re
 from threading import Event, Lock
+from collections.abc import Callable
 from typing import Protocol
 from urllib.parse import unquote_to_bytes, urlsplit, urlunsplit
 
@@ -20,6 +21,7 @@ from ticket_reviewer.config import RuntimeSettings, Settings
 from ticket_reviewer.data.repositories import AlertRepository, SettingRepository
 from ticket_reviewer.data.schema import (
     EventRow,
+    AlertRow,
     ObservationRow,
     OpportunityRow,
     OutcomeRow,
@@ -32,6 +34,8 @@ from ticket_reviewer.domain.enums import (
     Source,
     Team,
 )
+from ticket_reviewer.services.keyed_locks import KeyedLockRegistry
+from ticket_reviewer.services.secure_logging import install_http_log_redaction
 
 
 _CENT = Decimal("0.01")
@@ -50,6 +54,8 @@ _PUBLIC_HOSTS = {
     Source.TICKPICK: frozenset({"tickpick.com", "www.tickpick.com"}),
 }
 _TEAM_LABELS = {Team.TEXANS: "Texans", Team.AGGIES: "Texas A&M"}
+ListingLineage = tuple[str, str, str]
+GLOBAL_LINEAGE_LOCKS = KeyedLockRegistry[ListingLineage]()
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,10 +145,11 @@ class PushMessage:
 class NotificationFailure(RuntimeError):
     """A transport-safe notification error with no request or secret context."""
 
-    def __init__(self, *, retryable: bool) -> None:
-        if type(retryable) is not bool:
-            raise TypeError("retryable must be a bool")
+    def __init__(self, *, retryable: bool, delivery_unknown: bool = False) -> None:
+        if type(retryable) is not bool or type(delivery_unknown) is not bool:
+            raise TypeError("notification failure flags must be bools")
         self.retryable = retryable
+        self.delivery_unknown = delivery_unknown
         super().__init__(
             "notification temporarily unavailable"
             if retryable
@@ -252,7 +259,11 @@ def sanitize_click_url(source: object, value: object) -> str | None:
 
 class AlertPolicy:
     def __init__(self, settings: RuntimeSettings) -> None:
-        if not isinstance(settings, RuntimeSettings):
+        if (
+            not isinstance(settings, RuntimeSettings)
+            or settings.alert_profit_threshold < Decimal("50.00")
+            or settings.profit_improvement_threshold < Decimal("20.00")
+        ):
             raise TypeError("settings must be RuntimeSettings")
         self.settings = settings
 
@@ -429,6 +440,7 @@ class NtfyPublisher:
         *,
         client: object | None = None,
     ) -> None:
+        install_http_log_redaction()
         self.validate_configuration(topic, access_token, timeout_seconds)
         self.__topic = topic
         self.__access_token = access_token
@@ -449,6 +461,7 @@ class NtfyPublisher:
                 "httpcore.http11",
                 "httpcore.http2",
                 "httpcore.proxy",
+                "httpcore.socks",
             )
         )
         for logger in self.__loggers:
@@ -492,10 +505,12 @@ class NtfyPublisher:
                 content=message.body.encode("utf-8"),
                 headers=headers,
             )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise NotificationFailure(retryable=True) from None
         except (httpx.TimeoutException, httpx.NetworkError, httpx.RequestError):
-            raise NotificationFailure(retryable=True) from None
+            raise NotificationFailure(retryable=True, delivery_unknown=True) from None
         except Exception:
-            raise NotificationFailure(retryable=True) from None
+            raise NotificationFailure(retryable=False, delivery_unknown=True) from None
 
         if response.status_code == 429 or response.status_code >= 500:
             raise NotificationFailure(retryable=True)
@@ -504,7 +519,7 @@ class NtfyPublisher:
         try:
             payload = response.json()
         except Exception:
-            raise NotificationFailure(retryable=False) from None
+            raise NotificationFailure(retryable=False, delivery_unknown=True) from None
         provider_id = payload.get("id") if isinstance(payload, dict) else None
         secrets = (self.__topic, self.__access_token)
         if (
@@ -516,7 +531,7 @@ class NtfyPublisher:
                 for secret in secrets
             )
         ):
-            raise NotificationFailure(retryable=False)
+            raise NotificationFailure(retryable=False, delivery_unknown=True)
         return provider_id
 
     def close(self) -> None:
@@ -558,10 +573,14 @@ class AlertService:
         session_factory,
         *,
         publisher: Publisher | None = None,
+        clock: Callable[[], datetime] | None = None,
+        lineage_locks: KeyedLockRegistry[ListingLineage] | None = None,
     ) -> None:
         self.settings = settings
         self.session_factory = session_factory
         self.publisher = publisher
+        self._clock = clock
+        self._lineage_locks = lineage_locks or GLOBAL_LINEAGE_LOCKS
         self._state_lock = Lock()
         self._active_evaluations = 0
         self._delivery_flights: dict[str, _DeliveryFlight] = {}
@@ -595,13 +614,11 @@ class AlertService:
                     self._notification_test_flight = None
 
     def _perform_notification_test(self) -> NotificationTestResult:
-        if self.settings.dry_run:
-            return NotificationTestResult("dry-run")
         if self.publisher is None:
             return NotificationTestResult("missing-topic")
         message = PushMessage(
-            title="Ticket Reviewer test",
-            body="This is a local Ticket Reviewer test notification.",
+            title="TEST ONLY - Ticket Reviewer",
+            body="TEST ONLY: explicit local Ticket Reviewer notification check.",
             priority="default",
             tags=("test_tube",),
             click_url=None,
@@ -629,49 +646,70 @@ class AlertService:
                 if self._active_evaluations == 0:
                     self._delivery_flights.clear()
 
-    def _evaluate(self, opportunity_id: int, now: datetime) -> AlertDecision:
+    def _now(self, fallback: datetime | None = None) -> datetime:
+        value = self._clock() if self._clock is not None else fallback
+        if value is None:
+            value = datetime.now(timezone.utc)
+        if not _aware_datetime(value):
+            raise ValueError("clock must return a timezone-aware datetime")
+        return value.astimezone(timezone.utc)
+
+    def _evaluate(self, opportunity_id: int, caller_now: datetime) -> AlertDecision:
         try:
-            candidate, previous, effective = self._load(opportunity_id)
-            policy = AlertPolicy(effective)
-            decision = policy.decide(
-                candidate, previous, policy.is_stale(candidate.observed_at, now)
-            )
+            lineage = self._lineage_key(opportunity_id)
         except Exception:
             return _reject("invalid opportunity context")
-        if not decision.should_send or decision.fingerprint is None:
-            return decision
-        fingerprint = decision.fingerprint
-        with self._state_lock:
-            flight = self._delivery_flights.get(fingerprint)
-            leader = flight is None
-            if flight is None:
-                flight = _DeliveryFlight(Event())
-                self._delivery_flights[fingerprint] = flight
-        if not leader:
-            flight.completed.wait()
-            with self._state_lock:
-                shared = flight.decision
-            if shared is None:
-                return _reject("notification temporarily unavailable", fingerprint)
-            if shared.should_send:
-                return _reject("already sent", fingerprint)
-            return shared
-
-        try:
-            delivered = self._deliver(
-                opportunity_id, now, candidate, policy, decision
-            )
-        except BaseException:
-            with self._state_lock:
-                flight.decision = _reject(
-                    "notification temporarily unavailable", fingerprint
+        with self._lineage_locks.hold(lineage):
+            try:
+                evaluation_at = self._now(caller_now)
+                candidate, previous, effective = self._load(opportunity_id)
+                policy = AlertPolicy(effective)
+                decision = policy.decide(
+                    candidate,
+                    previous,
+                    policy.is_stale(candidate.observed_at, evaluation_at),
                 )
+            except Exception:
+                return _reject("invalid opportunity context")
+            if (
+                not decision.should_send
+                and decision.reason == "already sent"
+                and decision.fingerprint is not None
+            ):
+                return self._delivery_state_decision(decision.fingerprint)
+            if not decision.should_send or decision.fingerprint is None:
+                return decision
+            fingerprint = decision.fingerprint
+            with self._state_lock:
+                flight = self._delivery_flights.get(fingerprint)
+                leader = flight is None
+                if flight is None:
+                    flight = _DeliveryFlight(Event())
+                    self._delivery_flights[fingerprint] = flight
+            if not leader:
+                flight.completed.wait()
+                with self._state_lock:
+                    shared = flight.decision
+                if shared is None:
+                    return _reject("notification temporarily unavailable", fingerprint)
+                if shared.should_send:
+                    return _reject("already sent", fingerprint)
+                return shared
+            try:
+                delivered = self._deliver(
+                    opportunity_id, evaluation_at, candidate, policy, decision
+                )
+            except BaseException:
+                with self._state_lock:
+                    flight.decision = _reject(
+                        "delivery outcome unknown", fingerprint
+                    )
+                    flight.completed.set()
+                raise
+            with self._state_lock:
+                flight.decision = delivered
                 flight.completed.set()
-            raise
-        with self._state_lock:
-            flight.decision = delivered
-            flight.completed.set()
-        return delivered
+            return delivered
 
     def _deliver(
         self,
@@ -684,49 +722,117 @@ class AlertService:
         fingerprint = decision.fingerprint
         if fingerprint is None:
             return _reject("invalid opportunity context")
-        if self._already_sent(fingerprint):
-            return _reject("already sent", fingerprint)
-        if self.settings.dry_run:
-            provider_id = "dry-run"
-        else:
-            if self.publisher is None:
-                return _reject("notification rejected", fingerprint)
-            try:
-                provider_id = self.publisher.publish(policy.message(candidate))
-            except NotificationFailure as error:
-                return _reject(str(error), fingerprint)
-            except Exception:
-                return _reject("notification temporarily unavailable", fingerprint)
-            if (
-                not isinstance(provider_id, str)
-                or _PROVIDER_ID.fullmatch(provider_id) is None
-            ):
-                return _reject("notification rejected", fingerprint)
         try:
             with self.session_factory() as session:
                 repository = AlertRepository(session)
-                if repository.find_successful_by_fingerprint(fingerprint) is not None:
-                    return _reject("already sent", fingerprint)
-                repository.record(
+                alert_id, acquired, state = repository.claim_delivery(
                     opportunity_id,
                     fingerprint,
                     now,
                     candidate.estimated_net_profit,
-                    provider_id,
                 )
                 session.commit()
         except IntegrityError:
-            return _reject("already sent", fingerprint)
+            return self._delivery_state_decision(fingerprint)
+        except Exception:
+            return _reject("notification temporarily unavailable", fingerprint)
+        if not acquired:
+            return self._state_decision(state, fingerprint)
+        if self.settings.dry_run:
+            provider_id = "dry-run"
+        else:
+            if self.publisher is None:
+                self._mark_failed(alert_id, retryable=False)
+                return _reject("notification rejected", fingerprint)
+            try:
+                provider_id = self.publisher.publish(policy.message(candidate))
+            except NotificationFailure as error:
+                if not error.delivery_unknown:
+                    self._mark_failed(alert_id, retryable=error.retryable)
+                if error.delivery_unknown:
+                    return _reject("delivery outcome unknown", fingerprint)
+                return _reject(str(error), fingerprint)
+            except Exception:
+                return _reject("delivery outcome unknown", fingerprint)
+            if (
+                not isinstance(provider_id, str)
+                or _PROVIDER_ID.fullmatch(provider_id) is None
+            ):
+                return _reject("delivery outcome unknown", fingerprint)
+        try:
+            with self.session_factory() as session:
+                repository = AlertRepository(session)
+                repository.mark_sent(alert_id, self._now(now), provider_id)
+                session.commit()
         except Exception:
             return _reject("notification temporarily unavailable", fingerprint)
         return decision
 
-    def _already_sent(self, fingerprint: str) -> bool:
+    def _mark_failed(self, alert_id: int, *, retryable: bool) -> None:
+        try:
+            with self.session_factory() as session:
+                AlertRepository(session).mark_failed(alert_id, retryable=retryable)
+                session.commit()
+        except Exception:
+            # A persisted pending reservation is the conservative crash-safe fallback.
+            return
+
+    def _delivery_state_decision(self, fingerprint: str) -> AlertDecision:
+        try:
+            with self.session_factory() as session:
+                row = AlertRepository(session).find_by_fingerprint(fingerprint)
+                if row is None:
+                    return _reject("notification temporarily unavailable", fingerprint)
+                return self._state_decision(row.delivery_state, fingerprint)
+        except Exception:
+            return _reject("notification temporarily unavailable", fingerprint)
+
+    @staticmethod
+    def _state_decision(state: str, fingerprint: str) -> AlertDecision:
+        if state == "sent":
+            return _reject("already sent", fingerprint)
+        if state == "pending":
+            return _reject("delivery outcome unknown", fingerprint)
+        return _reject("notification rejected", fingerprint)
+
+    def _lineage_key(self, opportunity_id: int) -> ListingLineage:
         with self.session_factory() as session:
+            opportunity = session.get(OpportunityRow, opportunity_id)
+            if opportunity is None:
+                raise LookupError("missing opportunity")
+            observation = session.get(ObservationRow, opportunity.observation_id)
+            if observation is None or observation.event_id != opportunity.event_id:
+                raise LookupError("broken opportunity context")
             return (
-                AlertRepository(session).find_successful_by_fingerprint(fingerprint)
-                is not None
+                observation.source,
+                observation.event_external_id,
+                observation.listing_identity,
             )
+
+    def reconcile_unattempted(self, *, limit: int = 100) -> tuple[AlertDecision, ...]:
+        """Re-evaluate bounded committed opportunities after an interrupted handoff."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        with self.session_factory() as session:
+            ids = list(
+                session.scalars(
+                    select(OpportunityRow.id)
+                    .outerjoin(AlertRow, AlertRow.opportunity_id == OpportunityRow.id)
+                    .where(
+                        OpportunityRow.actionable.is_(True),
+                        (
+                            AlertRow.id.is_(None)
+                            | (
+                                (AlertRow.delivery_state == "failed")
+                                & AlertRow.retryable.is_(True)
+                            )
+                        ),
+                    )
+                    .order_by(OpportunityRow.id)
+                    .limit(limit)
+                )
+            )
+        return tuple(self.evaluate_and_send(value, self._now()) for value in ids)
 
     def _load(
         self, opportunity_id: int
@@ -793,7 +899,8 @@ class AlertService:
                 and lineage_outcome[1] is not None
                 and (
                     previous_row is None
-                    or lineage_outcome[0].updated_at > previous_row.sent_at
+                    or lineage_outcome[0].updated_at
+                    > (previous_row.sent_at or previous_row.reserved_at)
                 )
             ):
                 previous = PreviousAlert(

@@ -1,21 +1,30 @@
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
 from sqlalchemy import select
+from threading import Event
 
-from tests.factories import make_event, make_observation
+from tests.factories import make_estimate, make_event, make_observation
 from ticket_reviewer.bootstrap import build_services
 from ticket_reviewer.config import Settings
 from ticket_reviewer.connectors.base import Capability, ConnectorFailure, FailureCategory
 from ticket_reviewer.data.db import create_engine_and_session
-from ticket_reviewer.data.repositories import EventRepository, ObservationRepository, SettingRepository
+from ticket_reviewer.data.repositories import (
+    EventRepository,
+    ObservationRepository,
+    OpportunityRepository,
+    OutcomeRepository,
+    SettingRepository,
+)
 from ticket_reviewer.data.schema import (
     AlertRow,
     Base,
     ConnectorRunRow,
     EventRow,
+    ManualReviewRow,
     ObservationRow,
     OpportunityRow,
 )
@@ -324,7 +333,10 @@ def test_failed_run_commit_error_does_not_abort_later_connectors_or_leak(
     assert summary.observations_saved == 1
     with database() as session:
         runs = session.scalars(select(ConnectorRunRow)).all()
-        assert [(row.source, row.success) for row in runs] == [("stubhub", True)]
+        assert [(row.source, row.success) for row in runs] == [
+            ("ticketmaster", False),
+            ("stubhub", True),
+        ]
         assert all(secret not in (row.redacted_error or "") for row in runs)
 
 
@@ -439,6 +451,102 @@ def test_run_normalizes_offset_now_and_finish_to_utc(settings, database):
     assert summary.started_at == NOW
     assert summary.started_at.tzinfo is timezone.utc
     assert summary.finished_at == FINISHED
+
+
+def test_slow_connector_observations_use_current_evaluation_time(settings, database):
+    later = NOW + timedelta(minutes=6)
+    event = one_event()
+    candidate = one_observation(
+        observed_at=later,
+        listing_id="candidate",
+        pair_price=Decimal("100"),
+        buyer_fees=Decimal("0"),
+        estimated_tax=Decimal("0"),
+    )
+    comparisons = [
+        comparable_observation(
+            observed_at=later - timedelta(seconds=index),
+            pair_price=Decimal("300"),
+        )
+        for index in range(3)
+    ]
+    connector = FakeConnector(
+        Source.STUBHUB,
+        {Team.TEXANS: [event]},
+        {event.external_id: [candidate, *comparisons]},
+    )
+    scanner = ScanCoordinator(
+        settings,
+        database,
+        RepositoryBundle,
+        (connector,),
+        clock=lambda: later,
+    )
+
+    summary = scanner.run(NOW)
+
+    assert summary.opportunities_saved == 1
+    assert summary.actionable_opportunities == 1
+
+
+def test_blocked_remote_collection_holds_no_sqlite_write_transaction(tmp_path):
+    engine, factory = create_engine_and_session(
+        f"sqlite:///{tmp_path / 'no-network-transaction.db'}?timeout=0.1"
+    )
+    Base.metadata.create_all(engine)
+    entered = Event()
+    release = Event()
+
+    class BlockingConnector(FakeConnector):
+        def discover(self, team, starts_after, starts_before):
+            entered.set()
+            assert release.wait(timeout=5)
+            return []
+
+    connector = BlockingConnector(Source.STUBHUB, {}, {})
+    scanner = ScanCoordinator(
+        Settings(_env_file=None),
+        factory,
+        RepositoryBundle,
+        (connector,),
+        clock=lambda: FINISHED,
+    )
+    try:
+        with factory() as session:
+            event_id = EventRepository(session).upsert(one_event(external_id="writer-event"))
+            observation_id = ObservationRepository(session).add(
+                event_id,
+                one_observation(external_id="writer-event", listing_id="writer-listing"),
+            )
+            opportunity_id = OpportunityRepository(session).save_estimate(
+                event_id, observation_id, make_estimate()
+            )
+            session.commit()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            scan = pool.submit(scanner.run, NOW)
+            assert entered.wait(timeout=5)
+
+            def concurrent_writes():
+                with factory() as session:
+                    SettingRepository(session).set("budget_cap", "350.00")
+                    OutcomeRepository(session).save(opportunity_id, "watching")
+                    session.add(
+                        ManualReviewRow(
+                            screenshot_path="writer-placeholder.png",
+                            ocr_text=None,
+                            corrected_payload={"state": "unconfirmed"},
+                            confirmed_at=None,
+                        )
+                    )
+                    session.commit()
+
+            write = pool.submit(concurrent_writes)
+            write.result(timeout=2)
+            release.set()
+            assert scan.result(timeout=5).sources_succeeded == (Source.STUBHUB,)
+    finally:
+        release.set()
+        engine.dispose()
 
 
 def test_same_canonical_event_comparables_can_score_across_sources(settings, database):
@@ -557,7 +665,7 @@ def test_alert_service_receives_only_fresh_actionable_estimates(settings, databa
 
     assert summary.actionable_opportunities == 1
     assert len(alerts.calls) == 1
-    assert alerts.calls[0][1] == NOW
+    assert alerts.calls[0][1] == FINISHED
 
 
 def test_opportunity_commits_before_alert_evaluation(settings, database):
@@ -704,13 +812,15 @@ def test_real_alert_service_commits_dedupes_and_retries_without_failing_scan(
         {"event-1": [second_candidate]},
     )
 
-    second_summary = coordinator(
+    second_summary = ScanCoordinator(
         live_settings,
         database,
+        RepositoryBundle,
         (second_connector,),
         alert_service=AlertService(
             live_settings, database, publisher=timeout
         ),
+        clock=lambda: NOW + timedelta(minutes=1, seconds=2),
     ).run(NOW + timedelta(minutes=1))
 
     assert second_summary.sources_succeeded == (Source.STUBHUB,)
@@ -722,7 +832,10 @@ def test_real_alert_service_commits_dedupes_and_retries_without_failing_scan(
         ).all()
         assert len(opportunities) == 2
         second_opportunity_id = opportunities[-1].id
-        assert len(session.scalars(select(AlertRow)).all()) == 1
+        alert_rows = session.scalars(select(AlertRow).order_by(AlertRow.id)).all()
+        assert len(alert_rows) == 2
+        assert alert_rows[-1].delivery_state == "failed"
+        assert alert_rows[-1].retryable is True
         runs = session.scalars(
             select(ConnectorRunRow).order_by(ConnectorRunRow.id)
         ).all()

@@ -17,7 +17,7 @@ from ticket_reviewer.data.repositories import (
     RunRepository,
     SettingRepository,
 )
-from ticket_reviewer.data.schema import Base, SettingRow
+from ticket_reviewer.data.schema import Base, EventRow, SettingRow, SourceEventRow
 from ticket_reviewer.domain.enums import OpportunityStatus, Source
 from ticket_reviewer.domain.models import ExitScenario
 
@@ -127,6 +127,32 @@ def test_event_upsert_updates_source_metadata_without_duplicating_event(
     assert repository.find_by_source(Source.STUBHUB, sample_event.external_id).url == (
         "https://example.test/events/updated"
     )
+
+
+def test_source_refresh_cannot_relabel_a_shared_canonical_event(session, sample_event):
+    repository = EventRepository(session)
+    stub_id = repository.upsert(
+        replace(sample_event, opponent="Indianapolis Colts")
+    )
+    ticketmaster = replace(
+        sample_event,
+        source=Source.TICKETMASTER,
+        external_id="tm-colts",
+        opponent="Colts",
+    )
+    assert repository.upsert(ticketmaster, canonical_event_id=stub_id) == stub_id
+
+    remapped_id = repository.upsert(
+        replace(ticketmaster, opponent="Dallas Cowboys")
+    )
+
+    assert remapped_id != stub_id
+    assert session.get(EventRow, stub_id).opponent == "Indianapolis Colts"
+    links = session.scalars(select(SourceEventRow).order_by(SourceEventRow.source)).all()
+    assert {(row.source, row.event_id) for row in links} == {
+        ("stubhub", stub_id),
+        ("ticketmaster", remapped_id),
+    }
 
 
 def test_repository_writes_disappear_when_caller_rolls_back(
@@ -403,8 +429,8 @@ def test_setting_rejects_invalid_values(session, key, value):
     [
         ("budget_cap", "1", "1"),
         ("budget_cap", "400", "400"),
-        ("alert_profit_threshold", "0", "0"),
-        ("profit_improvement_threshold", "0", "0"),
+        ("alert_profit_threshold", "50", "50"),
+        ("profit_improvement_threshold", "20", "20"),
         ("observation_freshness_minutes", "60", "60"),
         ("observation_freshness_minutes", "1440", "1440"),
         ("scan_interval_minutes", "60", "60"),
@@ -517,6 +543,71 @@ def test_connector_run_finish_records_result_and_redacts_error(session):
     assert loaded.observation_count == 7
     assert loaded.redacted_error == "request failed: api_key=[REDACTED]"
     assert "super-secret-value" not in loaded.redacted_error
+
+
+@pytest.mark.parametrize("success", [0, 1, None, "yes"])
+def test_connector_run_finish_requires_a_strict_bool(session, success):
+    repository = RunRepository(session)
+    run_id = repository.start(Source.STUBHUB, datetime(2026, 8, 1, tzinfo=timezone.utc))
+    with pytest.raises(ValueError):
+        repository.finish(run_id, success=success, observation_count=0)
+
+
+@pytest.mark.parametrize("count", [True, -1, 1.5, Decimal("1.0")])
+def test_connector_run_finish_requires_a_nonnegative_int_count(session, count):
+    repository = RunRepository(session)
+    run_id = repository.start(Source.STUBHUB, datetime(2026, 8, 1, tzinfo=timezone.utc))
+    with pytest.raises(ValueError):
+        repository.finish(run_id, success=True, observation_count=count)
+
+
+def test_connector_run_finish_requires_aware_chronological_time(session):
+    repository = RunRepository(session)
+    started = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    run_id = repository.start(Source.STUBHUB, started)
+    for finished in (started.replace(tzinfo=None), started - timedelta(microseconds=1)):
+        with pytest.raises(ValueError):
+            repository.finish(
+                run_id,
+                success=True,
+                observation_count=0,
+                finished_at=finished,
+            )
+
+
+def test_connector_run_finish_requires_a_datetime_and_normalizes_to_utc(session):
+    repository = RunRepository(session)
+    started = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
+    run_id = repository.start(Source.STUBHUB, started)
+    with pytest.raises(ValueError):
+        repository.finish(
+            run_id,
+            success=True,
+            observation_count=0,
+            finished_at="2026-08-01T12:01:00Z",
+        )
+
+    repository.finish(
+        run_id,
+        success=True,
+        observation_count=0,
+        finished_at=datetime(
+            2026, 8, 1, 7, 1, tzinfo=timezone(timedelta(hours=-5))
+        ),
+    )
+
+    assert repository.get(run_id).finished_at == datetime(
+        2026, 8, 1, 12, 1, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [("alert_profit_threshold", "49.99"), ("profit_improvement_threshold", "19.99")],
+)
+def test_runtime_setting_repository_enforces_hard_alert_floors(session, key, value):
+    with pytest.raises(ValueError):
+        SettingRepository(session).set(key, value)
 
 
 @pytest.mark.parametrize(

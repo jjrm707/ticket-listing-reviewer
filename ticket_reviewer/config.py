@@ -18,11 +18,15 @@ class Settings(BaseSettings):
     )
 
     host: str = "127.0.0.1"
-    port: int = 8765
+    port: Annotated[int, Field(ge=8765, le=8765)] = 8765
     scan_interval_minutes: int = 60
     budget_cap: Decimal = Decimal("400.00")
-    alert_profit_threshold: Decimal = Decimal("50.00")
-    profit_improvement_threshold: Decimal = Decimal("20.00")
+    alert_profit_threshold: Annotated[
+        Decimal, Field(ge=Decimal("50.00"))
+    ] = Decimal("50.00")
+    profit_improvement_threshold: Annotated[
+        Decimal, Field(ge=Decimal("20.00"))
+    ] = Decimal("20.00")
     observation_freshness_minutes: int = 120
     ticketmaster_seller_fee_rate: Decimal = Decimal("0.15")
     seatgeek_seller_fee_rate: Decimal = Decimal("0.15")
@@ -60,8 +64,8 @@ class RuntimeSettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     budget_cap: Annotated[Decimal, Field(ge=Decimal("1"), le=Decimal("400"))]
-    alert_profit_threshold: Annotated[Decimal, Field(ge=Decimal("0"))]
-    profit_improvement_threshold: Annotated[Decimal, Field(ge=Decimal("0"))]
+    alert_profit_threshold: Annotated[Decimal, Field(ge=Decimal("50.00"))]
+    profit_improvement_threshold: Annotated[Decimal, Field(ge=Decimal("20.00"))]
     observation_freshness_minutes: Annotated[int, Field(ge=60, le=1440)]
     scan_interval_minutes: Literal[60]
     ticketmaster_seller_fee_rate: Annotated[

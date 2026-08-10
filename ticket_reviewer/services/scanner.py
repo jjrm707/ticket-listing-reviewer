@@ -204,16 +204,7 @@ class ScanCoordinator:
             try:
                 result = self._run_connector(connector, source, effective, started_at)
             except Exception as error:
-                safe_error = (
-                    error.safe_message
-                    if isinstance(error, ConnectorFailure)
-                    else _UNEXPECTED_ERROR
-                )
                 failed.append(source)
-                try:
-                    self._record_failed_run(source, started_at, safe_error)
-                except Exception:
-                    pass
                 continue
             succeeded.append(source)
             events_seen += result[0]
@@ -243,49 +234,86 @@ class ScanCoordinator:
         settings: RuntimeSettings,
         now: datetime,
     ) -> tuple[int, int, int, int]:
+        run_id: int | None = None
+        safe_error = _UNEXPECTED_ERROR
+        try:
+            run_id = self._start_run(source, now)
+            collected = self._collect_remote(connector, source, now)
+            evaluation_at = _utc(self._clock(), "evaluation_at")
+            session = self.session_factory()
+            try:
+                repositories = self.repository_factory(session)
+                persisted = self._persist_collection(
+                    source, collected[1], repositories, settings, evaluation_at
+                )
+                counts = (collected[0], *persisted[:3])
+                repositories.runs.finish(
+                    run_id,
+                    success=True,
+                    observation_count=counts[1],
+                    finished_at=_utc(self._clock(), "finished_at"),
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+            finally:
+                session.close()
+        except Exception as error:
+            safe_error = (
+                error.safe_message
+                if isinstance(error, ConnectorFailure)
+                else _UNEXPECTED_ERROR
+            )
+            try:
+                if run_id is None:
+                    self._record_failed_run(source, now, safe_error)
+                else:
+                    self._finish_failed_run(run_id, safe_error)
+            except Exception:
+                if run_id is not None:
+                    try:
+                        self._finish_failed_run(run_id, safe_error)
+                    except Exception:
+                        pass
+            raise
+
+        if self.alert_service is not None:
+            for opportunity_id in persisted[3]:
+                try:
+                    self.alert_service.evaluate_and_send(
+                        opportunity_id, evaluation_at
+                    )
+                except Exception:
+                    # Notification failure cannot change an already committed scan.
+                    continue
+        return counts
+
+    def _start_run(self, source: Source, started_at: datetime) -> int:
         session = self.session_factory()
         try:
             repositories = self.repository_factory(session)
-            run_id = repositories.runs.start(source, now)
-            collected = self._collect(connector, source, repositories, settings, now)
-            counts = collected[:4]
-            repositories.runs.finish(
-                run_id,
-                success=True,
-                observation_count=counts[1],
-                finished_at=_utc(self._clock(), "finished_at"),
-            )
+            run_id = repositories.runs.start(source, started_at)
             session.commit()
+            return run_id
         except Exception:
             session.rollback()
             raise
         finally:
             session.close()
 
-        if self.alert_service is not None:
-            for opportunity_id in collected[4]:
-                try:
-                    self.alert_service.evaluate_and_send(opportunity_id, now)
-                except Exception:
-                    # Notification failure cannot change an already committed scan.
-                    continue
-        return counts
-
-    def _collect(
+    def _collect_remote(
         self,
         connector: MarketplaceConnector,
         source: Source,
-        repositories: RepositoryBundle,
-        settings: RuntimeSettings,
         now: datetime,
-    ) -> tuple[int, int, int, int, tuple[int, ...]]:
-        freshness = timedelta(minutes=settings.observation_freshness_minutes)
+    ) -> tuple[int, tuple[tuple[ExternalEvent, tuple[SourceObservation, ...]], ...]]:
         seen_events: set[tuple[Source, str]] = set()
         seen_observations: set[
             tuple[Source, str, ObservationKind, str | None, datetime]
         ] = set()
-        events_seen = observations_saved = opportunities_saved = actionable = 0
-        alert_opportunity_ids: list[int] = []
+        events_seen = 0
+        collected: list[tuple[ExternalEvent, tuple[SourceObservation, ...]]] = []
 
         for team in (Team.TEXANS, Team.AGGIES):
             events = connector.discover(team, now, now + DISCOVERY_WINDOW)
@@ -301,10 +329,8 @@ class ScanCoordinator:
                 events_seen += 1
                 if not is_supported_home_game(event):
                     continue
-
-                event_id = _upsert_matched_event(repositories, event)
                 observations = connector.fetch_observations(event)
-                candidates: list[tuple[int, SourceObservation]] = []
+                accepted: list[SourceObservation] = []
                 for observation in observations:
                     if not isinstance(observation, SourceObservation):
                         raise TypeError("connector returned an invalid observation")
@@ -323,55 +349,91 @@ class ScanCoordinator:
                     if key in seen_observations:
                         continue
                     seen_observations.add(key)
-                    saved = repositories.observations.add_with_status(
-                        event_id, observation
-                    )
-                    if not saved.inserted:
-                        continue
-                    persisted_row = repositories.observations.get(
-                        saved.observation_id
-                    )
-                    if persisted_row is None:
-                        raise RuntimeError("persisted observation is unavailable")
-                    persisted = _observation_from_row(
-                        persisted_row, observation.event_external_id
-                    )
-                    observations_saved += 1
-                    if _confirmed_listing(persisted) and _fresh(
-                        persisted.observed_at, now, freshness
-                    ):
-                        candidates.append((saved.observation_id, persisted))
+                    accepted.append(observation)
+                collected.append((event, tuple(accepted)))
+        return events_seen, tuple(collected)
 
-                rows = repositories.observations.list_for_event(event_id)
-                for observation_id, candidate in candidates:
-                    fresh_comparisons = tuple(
-                        _observation_from_row(row, candidate.event_external_id)
-                        for row in rows
-                        if _fresh(row.observed_at, now, freshness)
-                    )
-                    estimate = estimate_opportunity(
-                        candidate,
-                        fresh_comparisons,
-                        _fee_profiles(settings),
-                        now,
-                        settings.budget_cap,
-                        kickoff_at=event.starts_at,
-                    )
-                    opportunity_id = repositories.opportunities.save_estimate(
-                        event_id, observation_id, estimate
-                    )
-                    opportunities_saved += 1
-                    if estimate.actionable:
-                        actionable += 1
-                        alert_opportunity_ids.append(opportunity_id)
+    def _persist_collection(
+        self,
+        source: Source,
+        collected: tuple[tuple[ExternalEvent, tuple[SourceObservation, ...]], ...],
+        repositories: RepositoryBundle,
+        settings: RuntimeSettings,
+        now: datetime,
+    ) -> tuple[int, int, int, tuple[int, ...]]:
+        freshness = timedelta(minutes=settings.observation_freshness_minutes)
+        observations_saved = opportunities_saved = actionable = 0
+        alert_opportunity_ids: list[int] = []
+        for event, observations in collected:
+            event_id = _upsert_matched_event(repositories, event)
+            candidates: list[tuple[int, SourceObservation]] = []
+            for observation in observations:
+                saved = repositories.observations.add_with_status(
+                    event_id, observation
+                )
+                if not saved.inserted:
+                    continue
+                persisted_row = repositories.observations.get(
+                    saved.observation_id
+                )
+                if persisted_row is None:
+                    raise RuntimeError("persisted observation is unavailable")
+                persisted = _observation_from_row(
+                    persisted_row, observation.event_external_id
+                )
+                observations_saved += 1
+                if _confirmed_listing(persisted) and _fresh(
+                    persisted.observed_at, now, freshness
+                ):
+                    candidates.append((saved.observation_id, persisted))
+
+            rows = repositories.observations.list_for_event(event_id)
+            for observation_id, candidate in candidates:
+                fresh_comparisons = tuple(
+                    _observation_from_row(row, candidate.event_external_id)
+                    for row in rows
+                    if _fresh(row.observed_at, now, freshness)
+                )
+                estimate = estimate_opportunity(
+                    candidate,
+                    fresh_comparisons,
+                    _fee_profiles(settings),
+                    now,
+                    settings.budget_cap,
+                    kickoff_at=event.starts_at,
+                )
+                opportunity_id = repositories.opportunities.save_estimate(
+                    event_id, observation_id, estimate
+                )
+                opportunities_saved += 1
+                if estimate.actionable:
+                    actionable += 1
+                    alert_opportunity_ids.append(opportunity_id)
 
         return (
-            events_seen,
             observations_saved,
             opportunities_saved,
             actionable,
             tuple(alert_opportunity_ids),
         )
+
+    def _finish_failed_run(self, run_id: int, safe_error: str) -> None:
+        session = self.session_factory()
+        try:
+            repositories = self.repository_factory(session)
+            repositories.runs.finish(
+                run_id,
+                success=False,
+                observation_count=0,
+                error=safe_error,
+                finished_at=_utc(self._clock(), "finished_at"),
+            )
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
 
     def _record_failed_run(
         self, source: Source, started_at: datetime, safe_error: str

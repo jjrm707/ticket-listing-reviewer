@@ -855,6 +855,22 @@ def test_detail_accepts_merged_replacement_but_preserves_requested_identity(
     assert observation.event_external_id == "120001"
 
 
+@respx.mock
+def test_detail_replacement_must_preserve_full_supported_identity(
+    connector, token_json, search_json, stubhub_event
+):
+    payload = detail(search_json)
+    payload["id"] = 120099
+    payload["venue"]["name"] = "Toyota Center"
+    authorize(token_json)
+    respx.get(DETAIL_URL).mock(return_value=httpx.Response(200, json=payload))
+
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.fetch_observations(stubhub_event)
+
+    assert caught.value.category is FailureCategory.PARSE
+
+
 @pytest.mark.parametrize(
     "mutation",
     ["different_opponent", "kickoff_outside_tolerance", "different_date"],

@@ -17,6 +17,16 @@ _ZERO = Decimal("0.0000")
 _SCORE_QUANTUM = Decimal("0.0001")
 _MAX_KICKOFF_DIFFERENCE = timedelta(hours=12)
 _SECONDS_PER_HOUR = Decimal("3600")
+_NFL_NICKNAMES = frozenset(
+    {
+        "49ers", "bears", "bengals", "bills", "broncos", "browns",
+        "buccaneers", "cardinals", "chargers", "chiefs", "colts",
+        "commanders", "cowboys", "dolphins", "eagles", "falcons",
+        "giants", "jaguars", "jets", "lions", "packers", "panthers",
+        "patriots", "raiders", "rams", "ravens", "saints", "seahawks",
+        "steelers", "texans", "titans", "vikings",
+    }
+)
 
 
 def normalize_label(value: str) -> str:
@@ -30,6 +40,15 @@ def normalize_label(value: str) -> str:
         for character in normalized
     )
     return " ".join(without_punctuation.split())
+
+
+def normalize_opponent(value: str) -> str:
+    """Normalize a stable NFL nickname without guessing unknown identities."""
+    label = normalize_label(value).removesuffix(" football").strip()
+    tokens = label.split()
+    if tokens and tokens[-1] in _NFL_NICKNAMES:
+        return tokens[-1]
+    return label
 
 
 def is_supported_home_game(event: ExternalEvent) -> bool:
@@ -51,8 +70,8 @@ def _kickoff_difference_seconds(left: ExternalEvent, right: ExternalEvent) -> De
 
 
 def _opponent_similarity(left: str, right: str) -> Decimal:
-    left_tokens = set(normalize_label(left).split())
-    right_tokens = set(normalize_label(right).split())
+    left_tokens = set(normalize_opponent(left).split())
+    right_tokens = set(normalize_opponent(right).split())
     if not left_tokens or not right_tokens:
         return Decimal("0")
     return Decimal(len(left_tokens & right_tokens)) / Decimal(len(left_tokens | right_tokens))

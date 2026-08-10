@@ -179,18 +179,38 @@ def test_health_uses_effective_freshness_override(client, session_factory):
     assert "90 minutes ago" in response.text
 
 
-def test_dry_run_notification_test_uses_prg_without_alert_history(client, session_factory):
-    response = client.post(
-        "/notifications/test",
-        data={"csrf_token": _csrf(client)},
-        follow_redirects=False,
+def test_dry_run_notification_test_uses_explicit_publisher_without_alert_history(
+    session_factory,
+):
+    class Publisher:
+        def __init__(self):
+            self.messages = []
+
+        def publish(self, message):
+            self.messages.append(message)
+            return "test-provider"
+
+    settings = Settings(
+        _env_file=None,
+        dry_run=True,
+        ntfy_topic="DryRunExplicitTestTopic_7K3mP9vR2xQ8wL5z",
     )
+    publisher = Publisher()
+    service = AlertService(settings, session_factory, publisher=publisher)
+    with _live_client(session_factory, settings, service) as client:
+        response = client.post(
+            "/notifications/test",
+            data={"csrf_token": _csrf(client)},
+            follow_redirects=False,
+        )
+        page = client.get(response.headers["location"])
 
     assert response.status_code == 303
-    assert response.headers["location"] == "/settings?result=dry-run"
+    assert response.headers["location"] == "/settings?result=sent"
     _assert_security_headers(response)
-    page = client.get(response.headers["location"])
-    assert "Dry run - no push sent" in page.text
+    assert "Test notification sent" in page.text
+    assert len(publisher.messages) == 1
+    assert "TEST ONLY" in publisher.messages[0].title
     with session_factory() as session:
         assert session.scalars(select(AlertRow)).all() == []
 
@@ -312,7 +332,7 @@ def test_live_notification_route_uses_owned_alert_service_publisher_once(session
     assert "provider-id-must-not-render" not in page.text
     assert len(publisher.messages) == 1
     message = publisher.messages[0]
-    assert message.title == "Ticket Reviewer test"
+    assert message.title == "TEST ONLY - Ticket Reviewer"
     assert message.click_url is None
     assert "test" in message.body.casefold()
 

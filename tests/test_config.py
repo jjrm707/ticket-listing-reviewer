@@ -15,9 +15,23 @@ def test_safe_defaults_are_local_and_dry_run():
     assert settings.budget_cap == Decimal("400.00")
     assert settings.alert_profit_threshold == Decimal("50.00")
     assert settings.profit_improvement_threshold == Decimal("20.00")
+    assert settings.port == 8765
     assert settings.observation_freshness_minutes == 120
     assert settings.stubhub_seller_fee_rate == Decimal("0.15")
     assert settings.dry_run is True
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("alert_profit_threshold", Decimal("49.99")),
+        ("profit_improvement_threshold", Decimal("19.99")),
+        ("port", 8766),
+    ],
+)
+def test_hard_alert_floors_and_fixed_launcher_port_cannot_be_lowered(field, value):
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
 
 
 @pytest.mark.parametrize("host", ["127.0.0.1", "::1", "localhost"])

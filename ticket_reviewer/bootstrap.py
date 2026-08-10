@@ -2,7 +2,7 @@
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Protocol
 
 import httpx
@@ -17,6 +17,7 @@ from ticket_reviewer.data.db import create_engine_and_session
 from ticket_reviewer.domain.enums import Source
 from ticket_reviewer.services.alerts import (
     AlertService as OpportunityAlertService,
+    GLOBAL_LINEAGE_LOCKS,
     NtfyPublisher,
 )
 from ticket_reviewer.services.scanner import (
@@ -25,6 +26,7 @@ from ticket_reviewer.services.scanner import (
     RepositoryFactory,
     ScanCoordinator,
 )
+from ticket_reviewer.services.secure_logging import install_http_log_redaction
 
 
 class CloseableConnector(Protocol):
@@ -115,6 +117,7 @@ def build_services(
     clock: Callable[[], datetime] | None = None,
 ) -> ApplicationServices:
     """Wire local services and configured official public connectors."""
+    install_http_log_redaction()
     connector_list = list(connectors)
     connector_sources = _snapshot_connector_sources(connector_list)
     topic_secret = settings.ntfy_topic
@@ -170,7 +173,11 @@ def build_services(
         owned_resources.append(publisher)
         try:
             effective_alert_service = OpportunityAlertService(
-                settings, session_factory, publisher=publisher
+                settings,
+                session_factory,
+                publisher=publisher,
+                clock=clock or (lambda: datetime.now(timezone.utc)),
+                lineage_locks=GLOBAL_LINEAGE_LOCKS,
             )
         except BaseException as error:
             _cleanup_without_masking(error, owned_resources)

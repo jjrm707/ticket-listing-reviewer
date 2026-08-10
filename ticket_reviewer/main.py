@@ -20,6 +20,7 @@ from ticket_reviewer.config import Settings
 from ticket_reviewer.services.scheduler import build_scheduler
 from ticket_reviewer.services.instance_guard import FileInstanceGuard
 from ticket_reviewer.services.keyed_locks import KeyedLockRegistry
+from ticket_reviewer.services.alerts import GLOBAL_LINEAGE_LOCKS
 from ticket_reviewer.services.ocr import OcrEngine, TesseractOcrEngine
 from ticket_reviewer.web import router as web_router
 from ticket_reviewer.web.routes import templates as web_templates
@@ -162,6 +163,12 @@ def create_app(
             migration_runner(effective_settings.database_url)
             services = services_factory(effective_settings)
             app.state.services = services
+            reconcile = getattr(getattr(services, "alert_service", None), "reconcile_unattempted", None)
+            if callable(reconcile):
+                try:
+                    reconcile()
+                except Exception:
+                    pass
             scheduler = scheduler_factory(
                 services.scanner.run,
                 effective_settings,
@@ -188,6 +195,7 @@ def create_app(
     app.state.manual_csrf_token = secrets.token_urlsafe(32)
     app.state.manual_confirmation_locks = KeyedLockRegistry[int]()
     app.state.outcome_locks = KeyedLockRegistry[int]()
+    app.state.lineage_locks = GLOBAL_LINEAGE_LOCKS
     web_root = Path(__file__).resolve().parent / "web"
     app.mount("/static", StaticFiles(directory=str(web_root / "static")), name="static")
     app.include_router(web_router)
@@ -229,7 +237,7 @@ def create_app(
             response.headers["Content-Security-Policy"] = (
                 "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; "
                 "form-action 'self'; object-src 'none'; img-src 'self' data:; "
-                "style-src 'self'; script-src 'self' https://cdn.jsdelivr.net; "
+                "style-src 'self'; script-src 'self'; "
                 "connect-src 'none'"
             )
         return response

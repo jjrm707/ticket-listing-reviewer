@@ -822,30 +822,38 @@ async def test_notification(request: Request):
                 status_code=error.status_code,
             )
     settings = request.app.state.settings
-    if settings.dry_run:
-        code = "dry-run"
-    else:
-        services = getattr(request.app.state, "services", None)
-        service = getattr(services, "alert_service", None)
-        method = getattr(service, "test_notification", None)
-        if callable(method):
-            try:
-                result = await run_in_threadpool(method)
-                code = result.code
-            except Exception:
-                code = "temporarily-unavailable"
-        elif _secret_text(settings.ntfy_topic, strip=False):
+    services = getattr(request.app.state, "services", None)
+    service = getattr(services, "alert_service", None)
+    method = getattr(service, "test_notification", None)
+    if callable(method):
+        try:
+            result = await run_in_threadpool(method)
+            code = result.code
+        except Exception:
             code = "temporarily-unavailable"
-        else:
-            code = "missing-topic"
+    elif _secret_text(settings.ntfy_topic, strip=False):
+        code = "temporarily-unavailable"
+    else:
+        code = "missing-topic"
     if code not in _SETTINGS_RESULTS:
         code = "temporarily-unavailable"
     return RedirectResponse(f"/settings?result={code}", status_code=303)
 
 
-def _outcome_lock(request: Request, opportunity_id: int):
-    registry: KeyedLockRegistry[int] = request.app.state.outcome_locks
-    return registry.hold(opportunity_id)
+def _outcome_lineage(session: Session, opportunity: OpportunityRow) -> tuple[str, str, str]:
+    observation = session.get(ObservationRow, opportunity.observation_id)
+    if observation is None or observation.event_id != opportunity.event_id:
+        raise _manual_error(503)
+    return (
+        observation.source,
+        observation.event_external_id,
+        observation.listing_identity,
+    )
+
+
+def _outcome_lock(request: Request, lineage: tuple[str, str, str]):
+    registry: KeyedLockRegistry[tuple[str, str, str]] = request.app.state.lineage_locks
+    return registry.hold(lineage)
 
 
 def _outcome_form_values(row: OutcomeRow | None) -> dict[str, str]:
@@ -921,7 +929,12 @@ async def update_outcome(
         return _outcome_error_response(
             request, context, opportunity, error.status_code
         )
-    with _outcome_lock(request, numeric_id):
+    lineage = _outcome_lineage(context.session, opportunity)
+    with _outcome_lock(request, lineage):
+        context.session.expire_all()
+        opportunity = context.session.get(OpportunityRow, numeric_id)
+        if opportunity is None:
+            raise HTTPException(status_code=404, detail="Opportunity not found")
         event_id = opportunity.event_id
         try:
             OutcomeRepository(context.session).save(
@@ -1291,6 +1304,15 @@ async def manual_confirm(request: Request):
                 raise _manual_error(404)
             if review.confirmed_at is not None:
                 payload = review.corrected_payload if isinstance(review.corrected_payload, dict) else {}
+                existing_opportunity_id = payload.get("opportunity_id")
+                services = getattr(request.app.state, "services", None)
+                alert_service = getattr(services, "alert_service", None)
+                evaluate = getattr(alert_service, "evaluate_and_send", None)
+                if type(existing_opportunity_id) is int and callable(evaluate):
+                    try:
+                        evaluate(existing_opportunity_id, _now(request))
+                    except Exception:
+                        pass
                 return _result_context(request, review_id, payload, repeated=True)
             now = _now(request)
             effective = SettingRepository(session).effective(request.app.state.settings)

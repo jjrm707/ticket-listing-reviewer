@@ -487,9 +487,13 @@ def test_actionable_confirmation_commits_before_alert_and_persists_comparable_id
     review_id, token, _response = _stage(client, tmp_path)
 
     response = client.post("/manual/confirm", data=_confirmation(review_id, token))
+    retry = client.post("/manual/confirm", data=_confirmation(review_id, token))
 
     assert response.status_code == 200
-    assert len(calls) == 1
+    assert retry.status_code == 200
+    assert "already confirmed" in retry.text
+    assert len(calls) == 2
+    assert calls[0][0] == calls[1][0]
     with session_factory() as session:
         opportunity = session.scalar(
             select(OpportunityRow)

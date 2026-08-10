@@ -4,7 +4,7 @@ This guide is for the Windows-local version-one reviewer. Run commands from the 
 
 ## 1. What the reviewer does and does not do.
 
-The reviewer is personal, local, read-only decision support for pairs of tickets to Houston Texans home games at NRG Stadium (the former Reliant Stadium name is recognized) and Texas A&M football home games at Kyle Field. It ranks estimates using a default `$400` all-in pair cap, a `$50` estimated-net alert threshold, and a `$20` improvement before a repeat alert. It scans immediately at startup and hourly while the PC is on.
+The reviewer is personal, local, read-only decision support for pairs of tickets to Houston Texans home games at NRG Stadium (the former Reliant Stadium name is recognized) and Texas A&M football home games at Kyle Field. It ranks estimates using a default `$400` all-in pair cap, a hard global minimum `$50` estimated-net alert threshold, and a hard global minimum `$20` improvement before a repeat alert. Runtime settings cannot lower those safety floors. It scans immediately at startup and hourly while the PC is on.
 
 It does not buy, reserve, list, relist, sell, reprice, transfer, or scrape tickets. It never automates a consumer marketplace page, makes no transaction, and offers no profit guarantee. The user checks every listing and makes every transaction manually.
 
@@ -84,7 +84,7 @@ Back up an existing database first. Then run the migration and confirm the exact
 & .\.venv\Scripts\python.exe -m alembic current
 ```
 
-Expected current revision: `0001_initial (head)`.
+Expected current revision: `0002_alert_delivery_state (head)`.
 
 ## 8. Start locally.
 
@@ -98,13 +98,13 @@ Open [http://127.0.0.1:8765](http://127.0.0.1:8765). Useful pages are `/healthz`
 
 Keep `TR_DRY_RUN=true`. Available official APIs can automatically collect event-level signals, but without authorized listing detail an actionable pair generally requires a screenshot you supply and correct. Manually compare at least three current public signals without asking the app to fetch marketplace pages. Check asking-price inputs, public links, timestamp/freshness, fees, estimated tax, seller-fee assumption, confidence, and risks. Upload one of your own PNG/JPEG screenshots, correct every OCR suggestion, confirm quantity two and all-in cost, and inspect the deterministic score.
 
-Dry-run qualifying decisions and fingerprints are stored with provider `dry-run`, but no normal push is delivered. Event floors and aggregates never become confirmed pairs.
+Dry-run qualifying decisions and fingerprints are stored with provider `dry-run`, but no normal opportunity push is delivered. Event floors and aggregates never become confirmed pairs. The one CSRF-protected Settings notification-test button is the deliberate exception: when a valid ntfy topic is configured, that explicit action sends an unmistakable `TEST ONLY` message even while dry-run remains enabled. It does not evaluate or publish an opportunity.
 
 ## 10. Enable normal alerts only after test.
 
 In Settings, explicitly submit the notification test and verify its receipt on the iPhone. Restart and confirm history remains. Only then stop the app, manually set `TR_DRY_RUN=false` in `.env`, and restart.
 
-Normal pushes still require a confirmed, fresh, medium/high-confidence pair at or below the budget with at least `$50` estimated net profit. A repeat needs a `$20` improvement. This does not enable auto-purchase. The pre-send reservation is safe for the normal one-process deployment; it is not a distributed exactly-once guarantee and never creates a false sent record after a failed publish.
+Normal pushes still require a confirmed, fresh, medium/high-confidence pair at or below the budget with at least `$50` estimated net profit. A repeat needs a `$20` improvement. This does not enable auto-purchase. Before any live publication, the app commits a unique `pending` fingerprint reservation. Provider acceptance followed by a successful database update changes it to `sent`; a known pre-accept transient failure becomes retryable `failed`. A crash, read-timeout, or database failure after possible acceptance deliberately leaves `pending`, and restart will not publish that ambiguous fingerprint again. This conservative policy prevents an automatic duplicate at the cost of possibly missing one notification. It is not atomic across ntfy and SQLite and is not a distributed exactly-once guarantee.
 
 ## 11. Install/uninstall Windows startup.
 
@@ -164,7 +164,7 @@ Estimates use visible asking prices, not completed sales. Buyer fees, tax, and s
 - [ ] Install official Python 3.12/3.13 and dependencies.
 - [ ] Copy `.env.example` to local `.env`; leave dry-run enabled.
 - [ ] Add only available official credentials and optional local Tesseract/ntfy settings.
-- [ ] Back up any existing DB, migrate to `0001_initial (head)`, and start with `scripts\run.ps1`.
+- [ ] Back up any existing DB, migrate to `0002_alert_delivery_state (head)`, and start with `scripts\run.ps1`.
 - [ ] Open `127.0.0.1`, inspect health, compare three signals, and confirm one screenshot score.
 - [ ] Submit the explicit ntfy test and verify the phone before disabling dry-run.
 
@@ -175,7 +175,7 @@ Estimates use visible asking prices, not completed sales. Buyer fees, tax, and s
 - `application is already running`: use the existing instance or stop it cleanly.
 - Missing/degraded source in `/health`: verify required credential pairs and current access. Event-only health can be successful while automatic actionable pairs remain unavailable.
 - OCR unavailable: verify `tesseract --version`, restart PowerShell after changing `PATH`, or correct fields manually.
-- No push: keep dry-run on while checking the exact topic/subscription, then use only the explicit Settings test. Errors intentionally omit secrets and raw provider bodies.
+- No normal opportunity push: keep dry-run on while checking the exact topic/subscription, then use only the explicit `TEST ONLY` Settings action. Errors intentionally omit secrets and raw provider bodies.
 
 ## Test commands
 

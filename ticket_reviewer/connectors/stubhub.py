@@ -18,7 +18,9 @@ from ticket_reviewer.config import Settings
 from ticket_reviewer.connectors.base import Capability, ConnectorFailure, FailureCategory
 from ticket_reviewer.domain.enums import ObservationKind, Source, Team
 from ticket_reviewer.domain.models import ExternalEvent, SourceObservation
+from ticket_reviewer.domain.matching import event_match_score
 from ticket_reviewer.services.retry import call_with_retry
+from ticket_reviewer.services.secure_logging import install_http_log_redaction
 
 
 _TOKEN_URL = "https://account.stubhub.com/oauth2/token"
@@ -98,6 +100,7 @@ class StubHubTokenProvider:
         *,
         sleep: Callable[[float], object] = time.sleep,
     ) -> None:
+        install_http_log_redaction()
         client_id = _credential_value(settings.stubhub_client_id)
         client_secret = _credential_value(settings.stubhub_client_secret)
         self._client_id = client_id
@@ -230,6 +233,7 @@ class StubHubConnector:
         clock: Callable[[], datetime] | None = None,
         owns_client: bool = False,
     ) -> None:
+        install_http_log_redaction()
         self._client = client
         self._sleep = sleep
         self._clock = clock or (lambda: datetime.now(timezone.utc))
@@ -287,8 +291,7 @@ class StubHubConnector:
         returned = _parse_event(payload, event.team)
         if (
             returned is None
-            or _opponent_identity(returned.opponent)
-            != _opponent_identity(event.opponent)
+            or event_match_score(returned, event) < Decimal("0.85")
             or abs(returned.starts_at - event.starts_at) > _DETAIL_START_TOLERANCE
         ):
             raise _parse_failure()

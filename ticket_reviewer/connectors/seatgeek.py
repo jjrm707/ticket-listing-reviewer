@@ -16,7 +16,9 @@ from ticket_reviewer.config import Settings
 from ticket_reviewer.connectors.base import Capability, ConnectorFailure, FailureCategory
 from ticket_reviewer.domain.enums import ObservationKind, Source, Team
 from ticket_reviewer.domain.models import ExternalEvent, SourceObservation
+from ticket_reviewer.domain.matching import event_match_score
 from ticket_reviewer.services.retry import call_with_retry
+from ticket_reviewer.services.secure_logging import install_http_log_redaction
 
 
 _SEARCH_URL = "https://api.seatgeek.com/2/events"
@@ -57,6 +59,7 @@ class SeatGeekConnector:
         clock: Callable[[], datetime] | None = None,
         owns_client: bool = False,
     ) -> None:
+        install_http_log_redaction()
         raw_client_id = settings.seatgeek_client_id
         client_id = (
             raw_client_id.get_secret_value().strip()
@@ -123,7 +126,7 @@ class SeatGeekConnector:
             parsed is None
             or parsed.external_id != event_id
             or parsed.starts_at != event.starts_at.astimezone(timezone.utc)
-            or _normalize_text(parsed.opponent) != _normalize_text(event.opponent)
+            or event_match_score(parsed, event) < Decimal("0.85")
         ):
             raise _parse_failure()
         if not isinstance(payload, dict):

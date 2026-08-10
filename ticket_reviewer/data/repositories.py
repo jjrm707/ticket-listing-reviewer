@@ -1,18 +1,19 @@
 """Small transaction-scoped repositories for persistence consumers."""
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 import re
 from collections.abc import Mapping
 import unicodedata
 
 from pydantic import ValidationError
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from ticket_reviewer.config import RuntimeSettings, Settings
 from ticket_reviewer.domain.enums import OpportunityStatus, Source, Team
+from ticket_reviewer.domain.matching import event_match_score
 from ticket_reviewer.domain.models import ExternalEvent, OpportunityEstimate, SourceObservation
 
 from .schema import (
@@ -42,8 +43,8 @@ ALLOWED_SETTING_FIELDS = frozenset(
 )
 _VALID_RUNTIME_BASE = {
     "budget_cap": Decimal("1"),
-    "alert_profit_threshold": Decimal("0"),
-    "profit_improvement_threshold": Decimal("0"),
+    "alert_profit_threshold": Decimal("50.00"),
+    "profit_improvement_threshold": Decimal("20.00"),
     "observation_freshness_minutes": 60,
     "scan_interval_minutes": 60,
     "stubhub_seller_fee_rate": Decimal("0"),
@@ -91,12 +92,27 @@ class EventRepository:
             event_row = self.session.get(EventRow, source_row.event_id)
             if event_row is None:
                 raise RuntimeError("source event references a missing event")
-            event_row.team = event.team.value
-            event_row.opponent = event.opponent
-            event_row.venue = event.venue
-            event_row.starts_at = event.starts_at
-            event_row.is_home = event.is_home
-            event_row.updated_at = now
+            if event_match_score(event, self._event_from_row(event_row, event.source)) < Decimal("0.85"):
+                matches = [
+                    row
+                    for row in self.list_for_team(event.team)
+                    if row.id != event_row.id
+                    and event_match_score(event, self._event_from_row(row, event.source))
+                    >= Decimal("0.85")
+                ]
+                if len(matches) == 1:
+                    event_row = matches[0]
+                else:
+                    event_row = EventRow(
+                        team=event.team.value,
+                        opponent=event.opponent,
+                        venue=event.venue,
+                        starts_at=event.starts_at,
+                        is_home=event.is_home,
+                    )
+                    self.session.add(event_row)
+                    self.session.flush()
+                source_row.event_id = event_row.id
             source_row.url = event.url
             source_row.raw_name = self._raw_name(event)
             source_row.last_seen = now
@@ -167,6 +183,20 @@ class EventRepository:
     @staticmethod
     def _raw_name(event: ExternalEvent) -> str:
         return f"{event.team.value} vs {event.opponent}"
+
+    @staticmethod
+    def _event_from_row(row: EventRow, source: Source) -> ExternalEvent:
+        return ExternalEvent(
+            source=source,
+            external_id=f"canonical:{row.id}",
+            team=Team(row.team),
+            opponent=row.opponent,
+            venue=row.venue,
+            starts_at=row.starts_at,
+            is_home=row.is_home,
+            is_parking=False,
+            url=None,
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -353,15 +383,14 @@ class AlertRepository:
         return self.session.scalar(
             select(AlertRow).where(
                 AlertRow.fingerprint == fingerprint,
-                AlertRow.provider_message_id.is_not(None),
-                AlertRow.provider_message_id != "",
+                AlertRow.delivery_state == "sent",
             )
         )
 
     def latest_for_lineage(
         self, source: str, event_external_id: str, listing_identity: str
     ) -> AlertRow | None:
-        """Return the latest successful alert for one stable listing lineage."""
+        """Return the latest attempted alert for one stable listing lineage."""
         return self.session.scalar(
             select(AlertRow)
             .join(OpportunityRow, AlertRow.opportunity_id == OpportunityRow.id)
@@ -370,12 +399,76 @@ class AlertRepository:
                 ObservationRow.source == source,
                 ObservationRow.event_external_id == event_external_id,
                 ObservationRow.listing_identity == listing_identity,
-                AlertRow.provider_message_id.is_not(None),
-                AlertRow.provider_message_id != "",
+                ~(
+                    (AlertRow.delivery_state == "failed")
+                    & AlertRow.retryable.is_(True)
+                ),
             )
-            .order_by(AlertRow.sent_at.desc(), AlertRow.id.desc())
+            .order_by(
+                func.coalesce(AlertRow.sent_at, AlertRow.reserved_at).desc(),
+                AlertRow.id.desc(),
+            )
             .limit(1)
         )
+
+    def claim_delivery(
+        self,
+        opportunity_id: int,
+        fingerprint: str,
+        reserved_at: datetime,
+        profit_at_send: Decimal,
+    ) -> tuple[int, bool, str]:
+        """Reserve before I/O; retry only a prior explicitly retryable failure."""
+        existing = self.find_by_fingerprint(fingerprint)
+        if existing is not None:
+            if existing.delivery_state == "failed" and existing.retryable is True:
+                existing.opportunity_id = opportunity_id
+                existing.delivery_state = "pending"
+                existing.retryable = False
+                existing.reserved_at = reserved_at
+                existing.sent_at = None
+                existing.profit_at_send = profit_at_send
+                existing.provider_message_id = None
+                self.session.flush()
+                return existing.id, True, "pending"
+            return existing.id, False, existing.delivery_state
+        row = AlertRow(
+            opportunity_id=opportunity_id,
+            fingerprint=fingerprint,
+            delivery_state="pending",
+            retryable=False,
+            reserved_at=reserved_at,
+            sent_at=None,
+            profit_at_send=profit_at_send,
+            provider_message_id=None,
+        )
+        self.session.add(row)
+        self.session.flush()
+        return row.id, True, "pending"
+
+    def mark_sent(
+        self, alert_id: int, sent_at: datetime, provider_message_id: str
+    ) -> None:
+        row = self.session.get(AlertRow, alert_id)
+        if row is None or row.delivery_state != "pending":
+            raise LookupError("alert reservation is unavailable")
+        row.delivery_state = "sent"
+        row.retryable = False
+        row.sent_at = sent_at
+        row.provider_message_id = provider_message_id
+        self.session.flush()
+
+    def mark_failed(self, alert_id: int, *, retryable: bool) -> None:
+        if type(retryable) is not bool:
+            raise ValueError("retryable must be a bool")
+        row = self.session.get(AlertRow, alert_id)
+        if row is None or row.delivery_state != "pending":
+            raise LookupError("alert reservation is unavailable")
+        row.delivery_state = "failed"
+        row.retryable = retryable
+        row.sent_at = None
+        row.provider_message_id = None
+        self.session.flush()
 
     def record(
         self,
@@ -387,8 +480,11 @@ class AlertRepository:
     ) -> int:
         existing = self.find_by_fingerprint(fingerprint)
         if existing is not None:
-            if not existing.provider_message_id:
+            if existing.delivery_state != "sent":
                 existing.opportunity_id = opportunity_id
+                existing.delivery_state = "sent" if provider_message_id else "failed"
+                existing.retryable = provider_message_id is None
+                existing.reserved_at = sent_at
                 existing.sent_at = sent_at
                 existing.profit_at_send = profit_at_send
                 existing.provider_message_id = provider_message_id
@@ -397,6 +493,9 @@ class AlertRepository:
         row = AlertRow(
             opportunity_id=opportunity_id,
             fingerprint=fingerprint,
+            delivery_state="sent" if provider_message_id else "failed",
+            retryable=provider_message_id is None,
+            reserved_at=sent_at,
             sent_at=sent_at,
             profit_at_send=profit_at_send,
             provider_message_id=provider_message_id,
@@ -570,12 +669,27 @@ class RunRepository:
         error: str | None = None,
         finished_at: datetime | None = None,
     ) -> None:
-        if observation_count < 0:
+        if type(run_id) is not int or run_id <= 0:
+            raise ValueError("run_id must be a positive integer")
+        if type(success) is not bool:
+            raise ValueError("success must be a bool")
+        if type(observation_count) is not int or observation_count < 0:
             raise ValueError("observation_count must be non-negative")
         row = self.session.get(ConnectorRunRow, run_id)
         if row is None:
             raise LookupError(f"connector run {run_id} does not exist")
-        row.finished_at = finished_at or utc_now()
+        completed = utc_now() if finished_at is None else finished_at
+        if (
+            not isinstance(completed, datetime)
+            or completed.tzinfo is None
+            or completed.utcoffset() is None
+        ):
+            raise ValueError("finished_at must be timezone-aware")
+        completed = completed.astimezone(timezone.utc)
+        started = row.started_at.astimezone(timezone.utc)
+        if completed < started:
+            raise ValueError("finished_at cannot precede started_at")
+        row.finished_at = completed
         row.success = success
         row.observation_count = observation_count
         row.redacted_error = _redact_error(error)

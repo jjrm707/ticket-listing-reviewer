@@ -21,8 +21,15 @@ from ticket_reviewer.data.repositories import (
     EventRepository,
     ObservationRepository,
     OpportunityRepository,
+    OutcomeRepository,
 )
-from ticket_reviewer.data.schema import AlertRow, Base, ObservationRow, OpportunityRow
+from ticket_reviewer.data.schema import (
+    AlertRow,
+    Base,
+    ObservationRow,
+    OpportunityRow,
+    OutcomeRow,
+)
 from ticket_reviewer.domain.enums import (
     Confidence,
     ObservationKind,
@@ -111,6 +118,19 @@ def test_49_99_does_not_send(policy):
 
     assert decision.should_send is False
     assert decision.reason == "below profit threshold"
+
+
+def test_policy_rejects_forged_runtime_thresholds_below_global_floors():
+    forged = RuntimeSettings.model_construct(
+        **{
+            **runtime().model_dump(),
+            "alert_profit_threshold": Decimal("1.00"),
+            "profit_improvement_threshold": Decimal("0.00"),
+        }
+    )
+
+    with pytest.raises(TypeError):
+        AlertPolicy(forged)
 
 
 def test_repeat_requires_20_dollar_improvement(policy):
@@ -468,6 +488,40 @@ def test_httpx_and_httpcore_logs_redact_topic_path_and_authorization(caplog):
     publisher.close()
 
 
+def test_marketplace_http_logs_are_redacted_without_ntfy_configuration(
+    database, caplog
+):
+    api_key = "LogSentinelTicketmasterKey_7K3mP9vR2xQ8wL5z"
+    auth_header = "LogSentinelStubHubBearer_8W4nQ2rT6yP1sD9k"
+    services = build_services(
+        Settings(_env_file=None, ticketmaster_api_key=api_key),
+        session_factory=database,
+        repository_factory=RepositoryBundle,
+    )
+    try:
+        with caplog.at_level(logging.DEBUG):
+            logging.getLogger("httpx").debug(
+                "GET https://app.ticketmaster.com/?apikey=%s Authorization=Bearer %s",
+                api_key,
+                auth_header,
+            )
+            logging.getLogger("httpcore.http11").debug(
+                "send_request_headers Authorization=Bearer %s", auth_header
+            )
+            logging.getLogger("httpcore.socks").debug(
+                "setup_socks5_connection apikey=%s Authorization=Bearer %s",
+                api_key,
+                auth_header,
+            )
+    finally:
+        services.close()
+
+    rendered = "\n".join(record.getMessage() for record in caplog.records)
+    assert api_key not in rendered
+    assert auth_header not in rendered
+    assert "Authorization" not in rendered
+
+
 def test_ntfy_fixture_contains_only_obvious_placeholders():
     fixture = FIXTURE.read_text(encoding="utf-8")
 
@@ -596,6 +650,205 @@ def test_dry_run_records_success_without_http_and_deduplicates_after_restart(dat
         assert rows[0].fingerprint == first.fingerprint
 
 
+def test_explicit_static_notification_test_is_allowed_while_dry_run(database):
+    publisher = RecordingPublisher("test-provider")
+    service = AlertService(
+        Settings(_env_file=None, dry_run=True), database, publisher=publisher
+    )
+
+    result = service.test_notification()
+
+    assert result.code == "sent"
+    assert len(publisher.messages) == 1
+    assert "TEST ONLY" in publisher.messages[0].title
+    assert "TEST ONLY" in publisher.messages[0].body
+    with database() as session:
+        assert session.scalars(select(AlertRow)).all() == []
+
+
+def test_delivery_reservation_is_committed_before_live_publication(database):
+    opportunity_id = save_opportunity(database)
+
+    class InspectingPublisher:
+        def publish(self, _message):
+            with database() as session:
+                row = session.scalar(select(AlertRow))
+                assert row.delivery_state == "pending"
+                assert row.sent_at is None
+                assert row.provider_message_id is None
+            return "provider-reserved"
+
+    decision = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=InspectingPublisher(),
+        clock=lambda: NOW + timedelta(minutes=7),
+    ).evaluate_and_send(opportunity_id, NOW)
+
+    assert decision.should_send is True
+    with database() as session:
+        row = session.scalar(select(AlertRow))
+        assert row.delivery_state == "sent"
+        assert row.reserved_at == NOW + timedelta(minutes=7)
+        assert row.sent_at == NOW + timedelta(minutes=7)
+
+
+def test_ambiguous_crash_reservation_suppresses_restart_duplicate(database):
+    opportunity_id = save_opportunity(database)
+
+    class CrashAfterAcceptance:
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, _message):
+            self.calls += 1
+            raise SystemExit("simulated process exit after provider acceptance")
+
+    crashing = CrashAfterAcceptance()
+    with pytest.raises(SystemExit):
+        AlertService(
+            Settings(_env_file=None, dry_run=False),
+            database,
+            publisher=crashing,
+        ).evaluate_and_send(opportunity_id, NOW)
+
+    restarted = RecordingPublisher("must-not-send")
+    result = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=restarted,
+    ).evaluate_and_send(opportunity_id, NOW)
+
+    assert result.should_send is False
+    assert result.reason == "delivery outcome unknown"
+    assert restarted.messages == []
+    with database() as session:
+        row = session.scalar(select(AlertRow))
+        assert row.delivery_state == "pending"
+
+
+def test_post_acceptance_database_failure_leaves_pending_and_never_republishes(
+    database, monkeypatch
+):
+    opportunity_id = save_opportunity(database)
+    accepted = RecordingPublisher("provider-accepted-before-db-failure")
+    original = AlertRepository.mark_sent
+
+    def fail_mark_sent(self, alert_id, sent_at, provider_message_id):
+        raise RuntimeError("simulated database failure after acceptance")
+
+    monkeypatch.setattr(AlertRepository, "mark_sent", fail_mark_sent)
+    first = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=accepted,
+    ).evaluate_and_send(opportunity_id, NOW)
+    monkeypatch.setattr(AlertRepository, "mark_sent", original)
+    restarted = RecordingPublisher("must-not-duplicate")
+    second = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=restarted,
+    ).evaluate_and_send(opportunity_id, NOW)
+
+    assert first.reason == "notification temporarily unavailable"
+    assert second.reason == "delivery outcome unknown"
+    assert len(accepted.messages) == 1
+    assert restarted.messages == []
+    with database() as session:
+        assert session.scalar(select(AlertRow)).delivery_state == "pending"
+
+
+def test_known_transient_failure_is_retryable_from_failed_reservation(database):
+    opportunity_id = save_opportunity(database)
+    live = Settings(_env_file=None, dry_run=False)
+    first = AlertService(
+        live,
+        database,
+        publisher=RecordingPublisher(NotificationFailure(retryable=True)),
+    ).evaluate_and_send(opportunity_id, NOW)
+    retry_publisher = RecordingPublisher("provider-retry")
+    second = AlertService(
+        live, database, publisher=retry_publisher
+    ).evaluate_and_send(opportunity_id, NOW)
+
+    assert first.should_send is False
+    assert second.should_send is True
+    assert len(retry_publisher.messages) == 1
+
+
+def test_service_clock_not_scan_start_controls_sent_at_and_repeat_baseline(database):
+    first_id = save_opportunity(database, profit=Decimal("55.00"))
+    delivery = NOW + timedelta(minutes=10)
+    AlertService(
+        Settings(_env_file=None, dry_run=True),
+        database,
+        clock=lambda: delivery,
+    ).evaluate_and_send(first_id, NOW)
+
+    with database() as session:
+        row = session.scalar(select(AlertRow))
+        assert row.sent_at == delivery
+
+
+def test_long_scan_delivery_time_preserves_the_true_twenty_dollar_baseline(database):
+    first_id = save_opportunity(database, profit=Decimal("55.00"))
+    delivery = NOW + timedelta(minutes=10)
+    AlertService(
+        Settings(_env_file=None, dry_run=True),
+        database,
+        clock=lambda: delivery,
+    ).evaluate_and_send(first_id, NOW)
+    with database() as session:
+        marker_id = save_opportunity(
+            database,
+            observed_at=NOW + timedelta(minutes=1),
+            profit=Decimal("100.00"),
+        )
+        marker = OutcomeRepository(session).save(marker_id, "watching")
+        session.get(OutcomeRow, marker).updated_at = NOW + timedelta(minutes=5)
+        session.commit()
+    later_id = save_opportunity(
+        database,
+        observed_at=delivery + timedelta(minutes=1),
+        profit=Decimal("75.00"),
+    )
+
+    decision = AlertService(
+        Settings(_env_file=None, dry_run=True),
+        database,
+        clock=lambda: delivery + timedelta(minutes=1),
+    ).evaluate_and_send(later_id, NOW + timedelta(minutes=1))
+
+    assert decision.should_send is True
+
+
+def test_startup_reconciliation_delivers_committed_unattempted_manual_opportunity(
+    database,
+):
+    opportunity_id = save_opportunity(
+        database,
+        source=Source.MANUAL,
+        event_external_id="manual-review:17",
+        listing_id="manual-review:17",
+    )
+    publisher = RecordingPublisher("provider-manual-reconcile")
+    service = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=publisher,
+        clock=lambda: NOW,
+    )
+
+    decisions = service.reconcile_unattempted()
+
+    assert len(decisions) == 1
+    assert decisions[0].should_send is True
+    assert len(publisher.messages) == 1
+    with database() as session:
+        assert session.scalar(select(AlertRow)).opportunity_id == opportunity_id
+
+
 def test_live_success_persists_provider_id_and_latest_lineage_controls_improvement(database):
     first_id = save_opportunity(database, profit=Decimal("55.00"))
     first_publisher = RecordingPublisher("provider-first")
@@ -710,12 +963,17 @@ def test_publish_failure_records_no_sent_alert_and_later_run_can_retry(database,
         else "notification rejected"
     )
     with database() as session:
-        assert session.scalars(select(AlertRow)).all() == []
+        row = session.scalar(select(AlertRow))
+        assert row.delivery_state == "failed"
+        assert row.retryable is retryable
+        assert row.sent_at is None
 
+    retry_publisher = RecordingPublisher("provider-retry")
     retry = AlertService(
-        live, database, publisher=RecordingPublisher("provider-retry")
+        live, database, publisher=retry_publisher
     ).evaluate_and_send(opportunity_id, NOW)
-    assert retry.should_send is True
+    assert retry.should_send is retryable
+    assert len(retry_publisher.messages) == int(retryable)
 
 
 def test_service_fails_closed_for_missing_context_bad_identity_and_bad_now(database):
@@ -770,20 +1028,7 @@ def test_overlapping_immediate_failures_share_one_delivery_attempt(
     opportunity_id = save_opportunity(database)
     live = Settings(_env_file=None, dry_run=False)
     callers = 8
-    load_barrier = Barrier(callers)
-    load_lock = Lock()
-    load_count = 0
-
-    class GatedAlertService(AlertService):
-        def _load(self, requested_id):
-            nonlocal load_count
-            loaded = super()._load(requested_id)
-            with load_lock:
-                load_count += 1
-                gated = load_count <= callers
-            if gated:
-                load_barrier.wait()
-            return loaded
+    start = Barrier(callers + 1)
 
     class ImmediateFailurePublisher:
         def __init__(self):
@@ -796,15 +1041,16 @@ def test_overlapping_immediate_failures_share_one_delivery_attempt(
             raise NotificationFailure(retryable=retryable)
 
     publisher = ImmediateFailurePublisher()
-    service = GatedAlertService(live, database, publisher=publisher)
+    service = AlertService(live, database, publisher=publisher)
+
+    def invoke():
+        start.wait(timeout=5)
+        return service.evaluate_and_send(opportunity_id, NOW)
 
     with ThreadPoolExecutor(max_workers=callers) as pool:
-        decisions = list(
-            pool.map(
-                lambda _: service.evaluate_and_send(opportunity_id, NOW),
-                range(callers),
-            )
-        )
+        futures = [pool.submit(invoke) for _index in range(callers)]
+        start.wait(timeout=5)
+        decisions = [future.result(timeout=5) for future in futures]
 
     expected = (
         "notification temporarily unavailable"
@@ -815,9 +1061,11 @@ def test_overlapping_immediate_failures_share_one_delivery_attempt(
     assert {decision.reason for decision in decisions} == {expected}
     later = service.evaluate_and_send(opportunity_id, NOW)
     assert later.reason == expected
-    assert publisher.calls == 2
+    assert publisher.calls == (2 if retryable else 1)
     with database() as session:
-        assert session.scalars(select(AlertRow)).all() == []
+        row = session.scalar(select(AlertRow))
+        assert row.delivery_state == "failed"
+        assert row.retryable is retryable
 
 
 def test_ungated_immediate_failure_is_singleflight_for_overlapping_callers(database):

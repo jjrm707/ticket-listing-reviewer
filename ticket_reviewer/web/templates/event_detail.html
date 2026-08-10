@@ -1,12 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Event detail · Ticket Listing Reviewer{% endblock %}
-{% block head %}<script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>{% endblock %}
 {% block content %}
 <section class="hero"><p class="eyebrow">Event evidence</p><h1>{{ event.team }} vs {{ event.opponent }}</h1><p>{{ event.venue }} · {{ event.kickoff }}</p>{% if result %}<p class="notice" role="status">{{ result }}</p>{% endif %}</section>
 <section><h2>Source event references</h2>{% if source_events %}<ul>{% for item in source_events %}<li>{{ item.source }} · {{ item.external_id }}{% if item.url %} · <a href="{{ item.url }}" rel="noopener noreferrer">Public event reference</a>{% endif %}</li>{% endfor %}</ul>{% else %}<p>No source references recorded.</p>{% endif %}</section>
 {% for notice in history_notices %}<p class="notice">{{ notice }}</p>{% endfor %}
 <section><h2>Price history</h2><p>Listing observations, event floors, and event aggregates are separate evidence types. Event-level signals do not confirm a buyable pair.</p>
-  <div class="chart-wrap"><canvas id="price-chart" aria-label="Price history by source and conservative seating group" role="img"></canvas></div><p class="chart-note">At narrow widths, use the complete table below for source and evidence labels.</p>
+  <div class="chart-wrap"><svg id="price-chart" viewBox="0 0 900 340" aria-labelledby="price-chart-title price-chart-desc" role="img"><title id="price-chart-title">Price history by source and conservative seating group</title><desc id="price-chart-desc">A local first-party line visualization; the complete accessible values are in the table below.</desc></svg></div><p class="chart-note">At narrow widths, use the complete table below for source and evidence labels.</p>
   <script id="chart-data" type="application/json">{{ chart|tojson }}</script>
   <div class="table-wrap"><table><caption>Price history table</caption><thead><tr><th scope="col">Observation</th><th scope="col">Source</th><th scope="col">Evidence</th><th scope="col">Seat group</th><th scope="col">Observed</th><th scope="col">Pair-basis price</th></tr></thead><tbody>
   {% for item in history %}<tr><th scope="row">#{{ item.id }}</th><td>{{ item.source }}</td><td>{{ item.kind }}</td><td>{{ item.seat }}</td><td>{{ item.observed }}</td><td>{{ item.price }}</td></tr>{% endfor %}

@@ -72,6 +72,16 @@ def _same_snapshot(candidate: SourceObservation, other: SourceObservation) -> bo
     )
 
 
+def _stable_listing_key(observation: SourceObservation) -> tuple[object, ...] | None:
+    if observation.kind is not ObservationKind.LISTING or not observation.listing_id:
+        return None
+    return (
+        observation.source,
+        observation.event_external_id,
+        observation.listing_id,
+    )
+
+
 def select_comparables(
     candidate: SourceObservation,
     observations: Sequence[SourceObservation],
@@ -89,8 +99,26 @@ def select_comparables(
         _require_aware(now, "now")
         reference = now
 
+    candidate_key = _stable_listing_key(candidate)
+    latest_listings: dict[tuple[object, ...], SourceObservation] = {}
+    for observation in supplied:
+        key = _stable_listing_key(observation)
+        if key is None:
+            continue
+        current = latest_listings.get(key)
+        if current is None or (observation.observed_at, observation.observation_id or 0) > (
+            current.observed_at,
+            current.observation_id or 0,
+        ):
+            latest_listings[key] = observation
+
     selected: list[Comparable] = []
     for observation in supplied:
+        stable_key = _stable_listing_key(observation)
+        if stable_key is not None and (
+            stable_key == candidate_key or latest_listings.get(stable_key) is not observation
+        ):
+            continue
         if observation.event_external_id != candidate.event_external_id:
             continue
         if observation.currency != "USD":

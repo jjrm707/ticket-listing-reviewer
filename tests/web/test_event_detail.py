@@ -46,6 +46,20 @@ def test_event_detail_distinguishes_event_floor_from_pair_listing(
     assert 'type="application/json"' in response.text
 
 
+def test_event_detail_uses_only_first_party_visualization_and_self_csp(
+    client, seeded_opportunities
+):
+    response = client.get("/events/1")
+
+    assert response.status_code == 200
+    assert "https://cdn.jsdelivr.net" not in response.text
+    assert "<svg" in response.text
+    assert 'src="https://' not in response.text
+    csp = response.headers["content-security-policy"]
+    assert "script-src 'self'" in csp
+    assert "https:" not in csp
+
+
 def test_event_chart_json_cannot_be_broken_out_by_hostile_labels(
     client, session_factory
 ):

@@ -136,6 +136,35 @@ def test_select_comparables_retains_exact_persisted_observation_identity():
     assert tuple(item.observation_id for item in selected) == (73,)
 
 
+def test_historical_snapshots_of_one_listing_are_one_comparable():
+    candidate = observation(listing_id="candidate", observation_id=1)
+    snapshots = tuple(
+        observation(
+            listing_id="stable-listing",
+            observation_id=index + 2,
+            observed_at=NOW - timedelta(hours=3 - index),
+            pair_price=Decimal(300 + index * 10),
+        )
+        for index in range(3)
+    )
+
+    selected = select_comparables(candidate, snapshots, now=NOW)
+
+    assert tuple(item.observation_id for item in selected) == (4,)
+    assert tuple(item.price_basis for item in selected) == (Decimal("320.00"),)
+
+
+def test_candidates_prior_snapshots_never_value_itself():
+    candidate = observation(listing_id="same-listing", observation_id=10)
+    prior = observation(
+        listing_id="same-listing",
+        observation_id=9,
+        observed_at=NOW - timedelta(hours=1),
+    )
+
+    assert select_comparables(candidate, (prior, candidate), now=NOW) == ()
+
+
 def test_event_level_evidence_has_lower_quality_than_listings():
     candidate = observation(listing_id="candidate")
     selected = select_comparables(

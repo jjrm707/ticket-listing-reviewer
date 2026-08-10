@@ -174,7 +174,14 @@ class AlertRow(Base):
         ForeignKey("opportunities.id", ondelete="CASCADE"), nullable=False
     )
     fingerprint: Mapped[str] = mapped_column(String(255), nullable=False)
-    sent_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    delivery_state: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pending", server_default="pending"
+    )
+    retryable: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("0")
+    )
+    reserved_at: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     profit_at_send: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     provider_message_id: Mapped[str | None] = mapped_column(String(255))
 

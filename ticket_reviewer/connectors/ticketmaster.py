@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, DecimalException, InvalidOperation, ROUND_HALF_UP
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -21,7 +21,9 @@ from ticket_reviewer.connectors.base import (
 )
 from ticket_reviewer.domain.enums import ObservationKind, Source, Team
 from ticket_reviewer.domain.models import ExternalEvent, SourceObservation
+from ticket_reviewer.domain.matching import event_match_score
 from ticket_reviewer.services.retry import call_with_retry
+from ticket_reviewer.services.secure_logging import install_http_log_redaction
 
 
 _SEARCH_URL = "https://app.ticketmaster.com/discovery/v2/events.json"
@@ -81,6 +83,7 @@ _AUTH_MESSAGE = "Ticketmaster authentication failed"
 _RATE_MESSAGE = "Ticketmaster rate limit reached"
 _NETWORK_MESSAGE = "Ticketmaster is temporarily unavailable"
 _PARSE_MESSAGE = "Ticketmaster response could not be parsed"
+_DETAIL_START_TOLERANCE = timedelta(minutes=5)
 
 
 class TicketmasterConnector:
@@ -98,6 +101,7 @@ class TicketmasterConnector:
         clock: Callable[[], datetime] | None = None,
         owns_client: bool = False,
     ) -> None:
+        install_http_log_redaction()
         secret = settings.ticketmaster_api_key
         api_key = secret.get_secret_value().strip() if secret is not None else ""
         if not api_key:
@@ -155,6 +159,14 @@ class TicketmasterConnector:
         url = _DETAIL_URL.format(event_id=quote(event_id, safe=""))
         payload = self._get_json(url, {"apikey": self._api_key})
         if not isinstance(payload, dict):
+            raise _parse_failure()
+        returned = _parse_event(payload)
+        if (
+            returned is None
+            or returned.external_id != event_id
+            or abs(returned.starts_at - event.starts_at) > _DETAIL_START_TOLERANCE
+            or event_match_score(returned, event) < Decimal("0.85")
+        ):
             raise _parse_failure()
         price_ranges = payload.get("priceRanges")
         if price_ranges is None:

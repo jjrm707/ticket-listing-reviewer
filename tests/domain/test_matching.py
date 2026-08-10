@@ -85,6 +85,18 @@ def test_same_game_across_sources_scores_above_threshold(tm_event, stubhub_event
     assert event_match_score(tm_event, stubhub_event) >= Decimal("0.85")
 
 
+def test_stable_nfl_nickname_matches_full_team_name_at_same_kickoff(texans_event):
+    full = replace(texans_event, opponent="Indianapolis Colts")
+    short = replace(
+        texans_event,
+        source=Source.STUBHUB,
+        external_id="stub-colts",
+        opponent="Colts",
+    )
+
+    assert event_match_score(full, short) >= Decimal("0.85")
+
+
 def test_conflicting_teams_score_zero(texans_event):
     aggies_event = replace(texans_event, team=Team.AGGIES, venue="Kyle Field")
 

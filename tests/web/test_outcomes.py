@@ -1,7 +1,9 @@
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 from decimal import Decimal
+from threading import Event
 
 import pytest
 from sqlalchemy import select
@@ -351,6 +353,71 @@ def test_terminal_outcome_suppresses_stale_scanner_snapshot_at_send_time(
     ).evaluate_and_send(stale_id, NOW + timedelta(minutes=2))
 
     assert decision.reason == "ineligible status"
+
+
+@pytest.mark.parametrize(
+    ("status", "values"),
+    [
+        ("passed", {}),
+        ("expired", {}),
+        ("purchased", {"actual_acquisition": "225.00"}),
+        ("sold", {"actual_proceeds": "300.00", "actual_fees": "45.00"}),
+    ],
+)
+def test_terminal_outcome_and_publish_share_the_listing_lineage_lock(
+    client, session_factory, status, values
+):
+    event_id, opportunity_id = _opportunity(session_factory)
+    with session_factory() as session:
+        candidate = session.get(
+            ObservationRow,
+            session.get(OpportunityRow, opportunity_id).observation_id,
+        )
+        session.add(
+            SourceEventRow(
+                event_id=event_id,
+                source=candidate.source,
+                external_id=candidate.event_external_id,
+                url="https://www.stubhub.com/event/123",
+                raw_name="Texans vs Colts",
+                last_seen=NOW,
+            )
+        )
+        session.commit()
+    entered = Event()
+    release = Event()
+
+    class BlockingPublisher:
+        def publish(self, _message):
+            entered.set()
+            assert release.wait(timeout=5)
+            return "provider-terminal-lock"
+
+    service = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        session_factory,
+        publisher=BlockingPublisher(),
+        lineage_locks=client.app.state.lineage_locks,
+        clock=lambda: NOW,
+    )
+    token = _csrf(client)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        delivery = pool.submit(service.evaluate_and_send, opportunity_id, NOW)
+        assert entered.wait(timeout=5)
+        outcome = pool.submit(
+            client.post,
+            f"/opportunities/{opportunity_id}/status",
+            data={"status": status, "csrf_token": token, **values},
+            follow_redirects=False,
+        )
+        time.sleep(0.05)
+        assert outcome.done() is False
+        release.set()
+        assert delivery.result(timeout=5).should_send is True
+        assert outcome.result(timeout=5).status_code == 303
+
+    with session_factory() as session:
+        assert session.get(OpportunityRow, opportunity_id).status == status
 
 
 def test_latest_terminal_marker_overrides_older_watching_marker_at_send_time(

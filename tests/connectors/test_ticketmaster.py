@@ -64,6 +64,22 @@ def tm_event():
     )
 
 
+def _detail_for(event: ExternalEvent) -> dict:
+    return {
+        "id": event.external_id,
+        "name": f"Houston Texans vs. {event.opponent}",
+        "url": event.url,
+        "dates": {"start": {"dateTime": event.starts_at.isoformat()}},
+        "_embedded": {
+            "attractions": [
+                {"name": "Houston Texans"},
+                {"name": event.opponent},
+            ],
+            "venues": [{"name": event.venue}],
+        },
+    }
+
+
 def test_connector_claims_only_public_event_capabilities():
     assert TicketmasterConnector.source is Source.TICKETMASTER
     assert TicketmasterConnector.capabilities == frozenset(
@@ -347,6 +363,7 @@ def test_detail_and_fallback_urls_use_the_same_public_url_boundary(
         return_value=httpx.Response(
             200,
             json={
+                **_detail_for(event),
                 "url": "https://evil.example/event/detail?token=detail-secret",
                 "priceRanges": [{"currency": "USD", "min": 50}],
             },
@@ -389,9 +406,33 @@ def test_public_price_range_is_pair_normalized_event_evidence(
     assert observation.listing_url == detail["url"]
 
 
+@pytest.mark.parametrize("mutation", ["id", "opponent", "venue", "kickoff"])
+@respx.mock
+def test_detail_response_is_bound_to_the_requested_supported_event(
+    connector, tm_event, fixture_json, mutation
+):
+    detail = fixture_json["_embedded"]["events"][0]
+    if mutation == "id":
+        detail["id"] = "swapped-event"
+    elif mutation == "opponent":
+        detail["name"] = "Dallas Cowboys at Houston Texans"
+        detail["_embedded"]["attractions"][1]["name"] = "Dallas Cowboys"
+    elif mutation == "venue":
+        detail["_embedded"]["venues"][0]["name"] = "Toyota Center"
+    else:
+        detail["dates"]["start"]["dateTime"] = "2026-09-14T17:00:00Z"
+    respx.get(DETAIL_URL).mock(return_value=httpx.Response(200, json=detail))
+
+    with pytest.raises(ConnectorFailure) as caught:
+        connector.fetch_observations(tm_event)
+
+    assert caught.value.category is FailureCategory.PARSE
+
+
 @respx.mock
 def test_price_parser_chooses_lowest_valid_usd_minimum(connector, tm_event):
     payload = {
+        **_detail_for(tm_event),
         "url": "https://www.ticketmaster.com/event/texans-colts-home",
         "priceRanges": [
             {"currency": "EUR", "min": 1},
@@ -425,7 +466,7 @@ def test_price_parser_chooses_lowest_valid_usd_minimum(connector, tm_event):
 def test_missing_or_unusable_price_ranges_return_no_observation(
     connector, tm_event, price_ranges
 ):
-    payload = {"url": tm_event.url}
+    payload = _detail_for(tm_event)
     if price_ranges is not None:
         payload["priceRanges"] = price_ranges
     respx.get(DETAIL_URL).mock(return_value=httpx.Response(200, json=payload))
@@ -501,6 +542,7 @@ def test_external_id_is_bounded_then_safely_encoded_as_one_path_segment(
         return_value=httpx.Response(
             200,
             json={
+                **_detail_for(event),
                 "url": tm_event.url,
                 "priceRanges": [{"currency": "USD", "min": 50}],
             },
