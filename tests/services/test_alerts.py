@@ -849,6 +849,134 @@ def test_startup_reconciliation_delivers_committed_unattempted_manual_opportunit
         assert session.scalar(select(AlertRow)).opportunity_id == opportunity_id
 
 
+def test_reconciliation_pages_past_old_rejected_rows_to_committed_manual_handoff(
+    database,
+):
+    """A full older page must not starve the next committed manual handoff."""
+    for index in range(100):
+        old_id = save_opportunity(
+            database,
+            event_external_id=f"old-rejected-{index}",
+            listing_id=f"old-rejected-{index}",
+        )
+        with database() as session:
+            session.get(OpportunityRow, old_id).status = OpportunityStatus.PASSED.value
+            session.commit()
+
+    manual_id = save_opportunity(
+        database,
+        source=Source.MANUAL,
+        event_external_id="manual-review:101",
+        listing_id="manual-review:101",
+    )
+    assert manual_id == 101
+    publisher = RecordingPublisher("provider-manual-after-page")
+
+    decisions = AlertService(
+        Settings(_env_file=None, dry_run=False),
+        database,
+        publisher=publisher,
+        clock=lambda: NOW,
+    ).reconcile_unattempted(limit=7)
+
+    assert len(decisions) == 101
+    assert len(publisher.messages) == 1
+    with database() as session:
+        row = session.scalar(select(AlertRow))
+        assert row is not None
+        assert row.opportunity_id == manual_id
+
+
+def test_reconciliation_keyset_retries_failed_skips_pending_and_advances_pages(
+    database,
+):
+    retry_id = save_opportunity(
+        database,
+        event_external_id="retryable-reconcile",
+        listing_id="retryable-reconcile",
+    )
+    live = Settings(_env_file=None, dry_run=False)
+    first = AlertService(
+        live,
+        database,
+        publisher=RecordingPublisher(NotificationFailure(retryable=True)),
+    ).evaluate_and_send(retry_id, NOW)
+    assert first.reason == "notification temporarily unavailable"
+
+    pending_id = save_opportunity(
+        database,
+        event_external_id="pending-reconcile",
+        listing_id="pending-reconcile",
+    )
+
+    class CrashAfterAcceptance:
+        def __init__(self):
+            self.calls = 0
+
+        def publish(self, _message):
+            self.calls += 1
+            raise SystemExit("simulated acceptance crash")
+
+    crashed = CrashAfterAcceptance()
+    with pytest.raises(SystemExit):
+        AlertService(live, database, publisher=crashed).evaluate_and_send(
+            pending_id, NOW
+        )
+
+    manual_id = save_opportunity(
+        database,
+        source=Source.MANUAL,
+        event_external_id="manual-review:retry-after-pending",
+        listing_id="manual-review:retry-after-pending",
+    )
+    publisher = RecordingPublisher("provider-reconcile-page")
+    decisions = AlertService(
+        live,
+        database,
+        publisher=publisher,
+        clock=lambda: NOW,
+    ).reconcile_unattempted(limit=1)
+
+    assert len(decisions) == 2
+    assert all(decision.should_send for decision in decisions)
+    assert len(publisher.messages) == 2
+    assert crashed.calls == 1
+    with database() as session:
+        rows = {row.opportunity_id: row for row in session.scalars(select(AlertRow))}
+        assert rows[retry_id].delivery_state == "sent"
+        assert rows[pending_id].delivery_state == "pending"
+        assert rows[manual_id].delivery_state == "sent"
+
+
+def test_reconciliation_dry_run_pages_without_normal_publication(database):
+    first_id = save_opportunity(
+        database,
+        event_external_id="dry-run-page-one",
+        listing_id="dry-run-page-one",
+    )
+    second_id = save_opportunity(
+        database,
+        event_external_id="dry-run-page-two",
+        listing_id="dry-run-page-two",
+    )
+    publisher = RecordingPublisher(AssertionError("dry-run must not publish"))
+
+    decisions = AlertService(
+        Settings(_env_file=None, dry_run=True),
+        database,
+        publisher=publisher,
+        clock=lambda: NOW,
+    ).reconcile_unattempted(limit=1)
+
+    assert len(decisions) == 2
+    assert all(decision.should_send for decision in decisions)
+    assert publisher.messages == []
+    with database() as session:
+        rows = {row.opportunity_id: row for row in session.scalars(select(AlertRow))}
+        assert rows[first_id].provider_message_id == "dry-run"
+        assert rows[second_id].provider_message_id == "dry-run"
+
+
 def test_live_success_persists_provider_id_and_latest_lineage_controls_improvement(database):
     first_id = save_opportunity(database, profit=Decimal("55.00"))
     first_publisher = RecordingPublisher("provider-first")

@@ -14,7 +14,7 @@ from typing import Protocol
 from urllib.parse import unquote_to_bytes, urlsplit, urlunsplit
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 
 from ticket_reviewer.config import RuntimeSettings, Settings
@@ -810,29 +810,52 @@ class AlertService:
             )
 
     def reconcile_unattempted(self, *, limit: int = 100) -> tuple[AlertDecision, ...]:
-        """Re-evaluate bounded committed opportunities after an interrupted handoff."""
+        """Re-evaluate a startup snapshot in bounded keyset pages.
+
+        ``limit`` bounds each database page.  The high-water mark keeps this
+        pass finite while allowing policy-rejected older rows to be examined
+        without starving a later committed handoff.
+        """
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("limit must be between 1 and 100")
         with self.session_factory() as session:
-            ids = list(
-                session.scalars(
-                    select(OpportunityRow.id)
-                    .outerjoin(AlertRow, AlertRow.opportunity_id == OpportunityRow.id)
-                    .where(
-                        OpportunityRow.actionable.is_(True),
-                        (
-                            AlertRow.id.is_(None)
-                            | (
-                                (AlertRow.delivery_state == "failed")
-                                & AlertRow.retryable.is_(True)
-                            )
-                        ),
+            high_water = session.scalar(select(func.max(OpportunityRow.id)))
+        if not isinstance(high_water, int) or high_water <= 0:
+            return ()
+
+        after_id = 0
+        decisions: list[AlertDecision] = []
+        while after_id < high_water:
+            with self.session_factory() as session:
+                ids = list(
+                    session.scalars(
+                        select(OpportunityRow.id)
+                        .outerjoin(
+                            AlertRow, AlertRow.opportunity_id == OpportunityRow.id
+                        )
+                        .where(
+                            OpportunityRow.id > after_id,
+                            OpportunityRow.id <= high_water,
+                            OpportunityRow.actionable.is_(True),
+                            (
+                                AlertRow.id.is_(None)
+                                | (
+                                    (AlertRow.delivery_state == "failed")
+                                    & AlertRow.retryable.is_(True)
+                                )
+                            ),
+                        )
+                        .order_by(OpportunityRow.id)
+                        .limit(limit)
                     )
-                    .order_by(OpportunityRow.id)
-                    .limit(limit)
                 )
+            if not ids:
+                break
+            decisions.extend(
+                self.evaluate_and_send(value, self._now()) for value in ids
             )
-        return tuple(self.evaluate_and_send(value, self._now()) for value in ids)
+            after_id = ids[-1]
+        return tuple(decisions)
 
     def _load(
         self, opportunity_id: int
