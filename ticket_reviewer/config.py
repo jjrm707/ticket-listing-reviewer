@@ -1,0 +1,94 @@
+"""Application configuration models."""
+
+from decimal import Decimal
+from pathlib import Path
+from typing import Annotated, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Settings for the local, dry-run application."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_prefix="TR_",
+        extra="ignore",
+    )
+
+    host: str = "127.0.0.1"
+    port: Annotated[int, Field(ge=8765, le=8765)] = 8765
+    scan_interval_minutes: int = 60
+    budget_cap: Decimal = Decimal("400.00")
+    alert_profit_threshold: Annotated[
+        Decimal, Field(ge=Decimal("50.00"))
+    ] = Decimal("50.00")
+    profit_improvement_threshold: Annotated[
+        Decimal, Field(ge=Decimal("20.00"))
+    ] = Decimal("20.00")
+    observation_freshness_minutes: int = 120
+    ticketmaster_seller_fee_rate: Decimal = Decimal("0.15")
+    seatgeek_seller_fee_rate: Decimal = Decimal("0.15")
+    stubhub_seller_fee_rate: Decimal = Decimal("0.15")
+    timezone: str = "America/Chicago"
+    database_url: str = "sqlite:///./data/ticket_reviewer.db"
+    screenshot_directory: Path = Path("data/screenshots")
+    dry_run: bool = True
+    ticketmaster_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
+    seatgeek_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
+    stubhub_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
+    ntfy_http_timeout_seconds: Annotated[float, Field(gt=0, le=120)] = 10.0
+
+    ticketmaster_api_key: SecretStr | None = None
+    seatgeek_client_id: SecretStr | None = None
+    seatgeek_client_secret: SecretStr | None = None
+    stubhub_client_id: SecretStr | None = None
+    stubhub_client_secret: SecretStr | None = None
+    ntfy_topic: SecretStr | None = None
+    ntfy_access_token: SecretStr | None = None
+
+    @field_validator("host", mode="before")
+    @classmethod
+    def validate_loopback_host(cls, value: object) -> str:
+        """Keep version-one listener configuration deliberately local."""
+
+        if type(value) is not str or value not in {"127.0.0.1", "::1", "localhost"}:
+            raise ValueError("host must be a canonical loopback address")
+        return value
+
+
+class RuntimeSettings(BaseModel):
+    """The non-secret settings available to runtime services."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    budget_cap: Annotated[Decimal, Field(ge=Decimal("1"), le=Decimal("400"))]
+    alert_profit_threshold: Annotated[Decimal, Field(ge=Decimal("50.00"))]
+    profit_improvement_threshold: Annotated[Decimal, Field(ge=Decimal("20.00"))]
+    observation_freshness_minutes: Annotated[int, Field(ge=60, le=1440)]
+    scan_interval_minutes: Literal[60]
+    ticketmaster_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
+    seatgeek_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
+    stubhub_seller_fee_rate: Annotated[
+        Decimal, Field(ge=Decimal("0"), le=Decimal("0.50"))
+    ]
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> "RuntimeSettings":
+        """Extract the non-secret settings used by runtime services."""
+
+        return cls(
+            budget_cap=settings.budget_cap,
+            alert_profit_threshold=settings.alert_profit_threshold,
+            profit_improvement_threshold=settings.profit_improvement_threshold,
+            observation_freshness_minutes=settings.observation_freshness_minutes,
+            scan_interval_minutes=settings.scan_interval_minutes,
+            ticketmaster_seller_fee_rate=settings.ticketmaster_seller_fee_rate,
+            seatgeek_seller_fee_rate=settings.seatgeek_seller_fee_rate,
+            stubhub_seller_fee_rate=settings.stubhub_seller_fee_rate,
+        )

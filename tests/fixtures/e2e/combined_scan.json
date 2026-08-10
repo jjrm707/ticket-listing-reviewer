@@ -1,0 +1,70 @@
+{
+  "fixture_notice": "Synthetic test fixture only. The confirmed listing does not imply any official public connector exposes listing detail.",
+  "event": {
+    "source": "stubhub",
+    "external_id": "synthetic-texans-home-001",
+    "team": "texans",
+    "opponent": "Colts",
+    "venue": "NRG Stadium",
+    "starts_at": "2026-09-13T17:00:00+00:00",
+    "url": "https://www.stubhub.com/synthetic-public-event"
+  },
+  "observations": [
+    {
+      "kind": "listing",
+      "listing_id": "synthetic-confirmed-pair",
+      "confirmed_fixture_listing": true,
+      "pair_price": "200.00",
+      "buyer_fees": "20.00",
+      "estimated_tax": "0.00",
+      "section": "123",
+      "row": "G",
+      "quantity_available": 2,
+      "can_buy_pair": true
+    },
+    {
+      "kind": "listing",
+      "listing_id": "synthetic-comparable-1",
+      "pair_price": "330.00",
+      "buyer_fees": "0.00",
+      "estimated_tax": "0.00",
+      "section": "123",
+      "row": "F",
+      "quantity_available": 2,
+      "can_buy_pair": false
+    },
+    {
+      "kind": "listing",
+      "listing_id": "synthetic-comparable-2",
+      "pair_price": "330.00",
+      "buyer_fees": "0.00",
+      "estimated_tax": "0.00",
+      "section": "123",
+      "row": "H",
+      "quantity_available": 2,
+      "can_buy_pair": false
+    },
+    {
+      "kind": "listing",
+      "listing_id": "synthetic-comparable-3",
+      "pair_price": "330.00",
+      "buyer_fees": "0.00",
+      "estimated_tax": "0.00",
+      "section": "123",
+      "row": "J",
+      "quantity_available": 2,
+      "can_buy_pair": false
+    },
+    {
+      "kind": "event_floor",
+      "listing_id": null,
+      "pair_price": "140.00",
+      "buyer_fees": null,
+      "estimated_tax": null,
+      "section": null,
+      "row": null,
+      "quantity_available": null,
+      "can_buy_pair": null
+    }
+  ]
+}

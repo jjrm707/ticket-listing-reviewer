@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Ticket Listing Reviewer{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', path='/app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to main content</a>
+  <header class="site-header">
+    <a class="brand" href="/">Ticket Listing Reviewer</a>
+    <nav aria-label="Primary"><a href="/">Opportunities</a><a href="/manual">Manual review</a><a href="/settings">Settings</a><a href="/health">Health</a></nav>
+  </header>
+  {% if request.app.state.settings.dry_run %}<aside class="dry-run-banner" role="status"><strong>Dry-run mode:</strong> qualifying alerts are recorded locally without push delivery.</aside>{% endif %}
+  <main id="main" tabindex="-1">{% block content %}{% endblock %}</main>
+  <footer>Local, read-only decision support. No purchasing or transaction access.</footer>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Update outcome · Ticket Listing Reviewer{% endblock %}
+{% block content %}
+<section class="hero">
+  <p class="eyebrow">Outcome update</p>
+  <h1>Review the recorded outcome</h1>
+  <p id="outcome-error" class="form-error" role="alert">{{ error }}</p>
+  <p><a href="/events/{{ event_id }}">Return to the complete event evidence</a></p>
+</section>
+{% include "outcome_form.html" %}
+{% endblock %}
